@@ -98,7 +98,6 @@ module RagIndex
   end
 end
 
-
 class GlaucoPlastic
   
   LMS_EXE_PATH     = File.expand_path(File.join(Dir.home, ".lmstudio", "bin", "lms.exe"))

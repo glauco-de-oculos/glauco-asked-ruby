@@ -2,7 +2,7 @@ Encoding.default_external = Encoding::UTF_8
 Encoding.default_internal = Encoding::UTF_8
 
 require 'java'
-require '../jarlibs/swt.jar'
+require './jarlibs/swt.jar'
 
 java_import 'org.eclipse.swt.widgets.Display'
 java_import 'org.eclipse.swt.widgets.Shell'
@@ -16,8 +16,6 @@ java_import 'java.awt.Toolkit'
 java_import 'java.awt.datatransfer.DataFlavor'
 java_import 'org.eclipse.swt.dnd.Clipboard'
 java_import 'org.eclipse.swt.dnd.TextTransfer'
-
-
 
 class WebAction
   attr_reader :result, :done
@@ -52,30 +50,37 @@ class WebAction
   end
 end
 
-require_relative '../glauco-automations/glauco-automotor.rb'
+require_relative '../glauco/glauco-framework.rb'
 
 puts "[GlaucoWebshell] 🚀 Definindo classe GlaucoWebshell..."
 # api_automacoes.rb
+unless defined?(ApiAutomacoes)
+  module ApiAutomacoes
+    # Módulo placeholder para evitar erro de referência
+  end
+end
 
-class GlaucoGUIShell < AutomationAgent
+class GlaucoGUIShell < GlaucoPlastic
   puts "[GlaucoWebshell] 🚀 Definindo método initialize..."
   attr_reader :shell, :browser, :display # Para acesso de leitura (objetos UI)
-  attr_accessor :state, :visible          # Para acesso de leitura/escrita (@state e @visible)
+  attr_accessor :state, :visible # Para acesso de leitura/escrita (@state e @visible)
   
-  # carregar arquivo api_automacoes.rb que define o módulo ApiAutomacoes
-  require_relative './api_automacoes.rb'
+  def initialize(visible: false, api_automacoes: File.expand_path("api_automacoes.rb", __dir__))
+    if api_automacoes && !api_automacoes.empty?
+      require_relative api_automacoes
+    end
 
-  def initialize
-    puts "[GlaucoWebshell] 🚀 Inicializando GlaucoWebshell com UI..."
-    # start_ui_thread
-    super
+    require 'ruby_llm'
+    @state = { current_url: nil, last_action: nil, context: {} }
+    @lmstudio_ready = false
+
+    start_ui_thread if @visible
+    start_lmstudio
     setup_llm
   end
 
   def setup_llm
-    @chat = super( 
-      domain_specific_knowledge: File.expand_path('dinamicas diretrizes - prompt.md', __dir__), 
-    )
+    @chat = super(system_config_instructions: File.expand_path("system_config_instructions.md",  __dir__), domain_specific_knowledge: File.expand_path('dinamicas diretrizes - prompt.md', __dir__))
 
     puts "super setup_llm:#{@chat}"
 
@@ -634,4 +639,3 @@ module Frontend
     $display.dispose  
   end
 end
-

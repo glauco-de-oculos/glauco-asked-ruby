@@ -2,7 +2,7 @@
 # Suite completa de testes para o Glauco Framework (BrowserAutoAgent + FS + Docs + OS)
 # Cada bloco imprime de forma analítica o resultado e simula cenários reais.
 
-require_relative './glauco-guishell.rb'
+require_relative './glauco-framework.rb'
 
 agent = GlaucoGUIShell.new
 

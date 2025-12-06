@@ -1,7 +1,6 @@
-require_relative 'glauco-framework'
+require_relative '../glauco-framework/glauco-framework'
 
 include Frontend
-include Agents
 
 # Componente de chat integrado ao LLM (simples)
 class ChatApp < Component
@@ -10,7 +9,7 @@ class ChatApp < Component
     @state[:messages] = []
     @state[:input] = ""
 
-    @agent = AutomationAgent.new(ui: false) 
+    @agent = GlaucoGUIShell.new
 
     define_render do
       div(style: "padding:20px; font-family:sans-serif;") do

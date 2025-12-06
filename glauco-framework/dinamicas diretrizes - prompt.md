@@ -4,8 +4,6 @@
 
 Cada vídeo na lista é representado pelo seletor ytd-rich-item-renderer com um elemento "a" nele contendo o título no atributo aria-label. Para abrir nele, é só clicar no link
 
-
-
 ---
 
 ### 📁 1. Arquivos têm um “lugar onde vivem”
