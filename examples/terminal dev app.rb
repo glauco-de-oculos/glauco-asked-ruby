@@ -2,9 +2,9 @@
 # Suite completa de testes para o Glauco Framework (BrowserAutoAgent + FS + Docs + OS)
 # Cada bloco imprime de forma analítica o resultado e simula cenários reais.
 
-require_relative './glauco-framework.rb'
+require_relative '../glauco-framework/glauco-framework'
 
-agent = GlaucoGUIShell.new
+agent = GUIShell.new
 
 def banner(title)
   puts "\n" + "=" * 80
@@ -31,7 +31,7 @@ puts "Digite 'exit' ou 'sair' para encerrar.\n\n"
 
 loop do
   print ">> "
-  input = STDIN.gets&.strip
+  input = STDIN.gets&.strip&.dup
   break if input.nil? || input.downcase == "exit" || input.downcase == "sair"
 
   if input.empty?

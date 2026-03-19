@@ -50,94 +50,106 @@ class WebAction
   end
 end
 
-require_relative '../glauco/glauco-framework.rb'
+require_relative '../glauco/GlaucoLLM'
 
 puts "[GlaucoWebshell] 🚀 Definindo classe GlaucoWebshell..."
-# api_automacoes.rb
-unless defined?(ApiAutomacoes)
-  module ApiAutomacoes
-    # Módulo placeholder para evitar erro de referência
+
+class ApiRuntime
+  def initialize(browser:, display:, host:)
+    @browser = browser
+    @display = display
+    @host = host
+  end
+
+  def open_url(url)
+    raise "browser nil" unless @browser
+    raise "host nil" unless @host
+
+    @host.ensure_ui_alive
+
+    @host.run_ui do
+      @browser.setUrl(url)
+    end
+
+    "opened #{url}"
+  end
+
+  def eval_js(js)
+    @host.run_ui { @browser.evaluate(js) }
   end
 end
 
-class GlaucoGUIShell < GlaucoPlastic
-  puts "[GlaucoWebshell] 🚀 Definindo método initialize..."
-  attr_reader :shell, :browser, :display # Para acesso de leitura (objetos UI)
-  attr_accessor :state, :visible # Para acesso de leitura/escrita (@state e @visible)
-  
-  def initialize(visible: false, api_automacoes: File.expand_path("api_automacoes.rb", __dir__))
-    if api_automacoes && !api_automacoes.empty?
-      require_relative api_automacoes
-    end
 
-    require 'ruby_llm'
+class GUIShell < GlaucoLLM
+  attr_reader :shell, :browser, :display
+  attr_accessor :state, :visible
+
+  def initialize(visible: false)
+    super()
+
+    @visible = visible
     @state = { current_url: nil, last_action: nil, context: {} }
-    @lmstudio_ready = false
 
     start_ui_thread if @visible
-    start_lmstudio
-    setup_llm
+
+    puts "[GUIShell] BEFORE setup_llm"
+
+    setup_llm(
+      system_config_instructions: File.expand_path("system_config_instructions.md", __dir__),
+      domain_specific_knowledge: File.expand_path("dinamicas diretrizes - prompt.md", __dir__)
+    )
+
+    puts "[GUIShell] AFTER setup_llm"
+
+    setup_runtime
   end
 
-  def setup_llm
-    @chat = super(system_config_instructions: File.expand_path("system_config_instructions.md",  __dir__), domain_specific_knowledge: File.expand_path('dinamicas diretrizes - prompt.md', __dir__))
+  # ===========================================================
+  # 🔑 NOVO: runtime injection
+  # ===========================================================
+  def setup_runtime
+    ensure_ui_alive
 
-    puts "super setup_llm:#{@chat}"
+    runtime = ApiRuntime.new(
+      browser: @browser,
+      display: @display,
+      host: self
+    )
 
-    carregar_api_de_automacoes
-  end
-  
-  def carregar_api_de_automacoes
-    begin 
-      tool_classes = ApiAutomacoes.constants.map do |const_name|
-      tool_class = ApiAutomacoes.const_get(const_name)
-        if tool_class.is_a?(Class) && tool_class.ancestors.include?(RubyLLM::Tool)
-          # 🔑 PASSO CRÍTICO: Inicialize a ferramenta passando a instância do agente (self)
-          tool_class.new(agente_host: self) 
-        end
-      end.compact
+    # 🔑 apenas injeta runtime
+    @agent.instance_variable_set(:@runtime, runtime)
 
-      @chat.with_tools(*tool_classes)
-      true
-    rescue
-      puts "Falhou"
-      false
-    end
+    # 🔑 atualizar lista de métodos
+    runtime_methods = runtime.public_methods(false).map(&:to_s)
+    @agent.instance_variable_set(:@runtime_methods, runtime_methods)
   end
 
-  public
+  # ===========================================================
+  # execução
+  # ===========================================================
   def interpretar(input_text)
-    case input_text
-    when "carregar base de conhecimento"
-      carregar_base_de_conhecimento 
-    when "carregar api de automações"
-      carregar_api_de_automacoes
-    
-    else
-      puts "[Interpreter] input_text: #{input_text.inspect}"
-      
-      wait_for_http_ready(SERVER_PORT)
-      
-      result = ""
-      run_ui do 
-        puts "@browser #{browser}"
-        @chat.ask(super(input_text)) { |chunk| result << chunk.content.to_s }
-      end
-      #puts "[Interpreter] Resposta bruta do LLM:\n#{result}"
+    raise "runtime não configurado" unless @agent.instance_variable_get(:@runtime)
 
-      result
+    puts "[Interpreter] input_text: #{input_text.inspect}"
+
+    result = @agent.run(input_text)
+
+    run_ui do
+      puts "[UI] browser=#{browser}"
     end
+
+    result
   end
 
+  # ===========================================================
+  # UI
+  # ===========================================================
   def start_ui_thread
     if defined?(@display) && @display && !@display.isDisposed
-      puts "[UI] ⚠️ Display ainda ativo, descartando antes de recriar..."
       @display.async_exec { @shell.dispose rescue nil }
       sleep 0.5
       @display.dispose rescue nil
     end
-
-    puts "[UI] 🚀 Criando nova thread de UI..."
 
     ready = false
 
@@ -147,25 +159,23 @@ class GlaucoGUIShell < GlaucoPlastic
         @shell   = Shell.new(@display)
         @shell.setLayout(FillLayout.new)
         @browser = Browser.new(@shell, 0)
+
         @shell.setText("Agente de Automação")
         @shell.setSize(1024, 768)
         @shell.open
 
         ready = true
-        puts "[UI] 🧠 Thread de UI iniciada (#{Thread.current.object_id})"
 
         while !@shell.disposed?
           @display.sleep unless @display.read_and_dispatch
         end
 
-        puts "[UI] 💥 Loop gráfico finalizado. Encerrando display..."
         @display.dispose rescue nil
       rescue => e
-        puts "[UI] ❌ Erro crítico no loop de UI: #{e.class} - #{e.message}"
+        puts "[UI ERROR] #{e.class} - #{e.message}"
       end
     end
 
-    # espera a UI estar de pé
     start = Time.now
     until ready && @browser && !@browser.isDisposed
       sleep 0.05
@@ -175,87 +185,44 @@ class GlaucoGUIShell < GlaucoPlastic
 
   def ensure_ui_alive
     if @ui_thread.nil? || !@ui_thread.alive?
-        puts "[UI] 🧩 Thread de UI encerrada — reiniciando..."
-        start_ui_thread
-        sleep 0.5 # pequeno atraso para garantir criação do Display
+      start_ui_thread
+      sleep 0.5
     end
-  
+
     if @display.nil? || @display.isDisposed
-        puts "[UI] 🧩 Display inválido — reiniciando..."
-        start_ui_thread
+      start_ui_thread
     end
   end
 
-# Automation
-  def read_html
-    run_async do
-      @browser.evaluate("return document.documentElement.outerHTML;")
-    end
-  end
-
-  def evaluate(js, label = nil)
-    run_ui { 
-      result = @browser.evaluate(js)
-      # puts "[#{label} - Evaluate]: #{result}"
-      result
-    }
-  end
-
-  def run_async(&block)
-    if @display.nil? || @display.isDisposed
-      puts "[run_async] ⚠️ Display inexistente — recriando..."
-      @display = Display.new
-    end
-
-    if Display.get_current
-      block.call
-    else
-      @display.async_exec(&block)
-      @display.wake
-    end
-  end
-
-
+  # ===========================================================
+  # execução UI segura
+  # ===========================================================
   def run_ui(&block)
-  
-    puts "[UI] 🚀 Executando bloco no thread de UI... #{block.inspect}"
     ensure_ui_alive
 
     if Thread.current == @ui_thread
-      # já estamos no thread de UI
       block.call
     else
-      # executa o bloco dentro do thread da UI
-      
-      # 🔑 PASSO 1: Captura explícita do bloco (referência forte contra GC).
-      ui_block = block 
-      
       result = nil
-      
-      puts "[UI] 🧠 Enviando bloco para execução no thread de UI..."
-      
-      # 🔑 PASSO 2 CRÍTICO: Uso de sync_exec (e não async_exec).
-      # Isso BLOQUEIA o thread chamador (onde está o `open_url`) até que
-      # o thread da UI termine a execução do bloco, garantindo que `ui_block`
-      # esteja no escopo e não seja liberado.
-      @display.sync_exec do 
-        begin
-          # Use a variável local capturada.
-          puts "[UI] 🚀 Bloco recebido no thread de UI, executando... #{ui_block.class.inspect}"
-          
-          # Agora a chamada é segura.
-          result = ui_block.call
-          
-        rescue => e
-          puts "[UI] ❌ Erro ao executar no thread de UI: #{e.class} - #{e.message}"
-          raise e 
-        end
+
+      @display.sync_exec do
+        result = block.call
       end
-      
-      return result
+
+      result
     end
   end
-  
+
+  # ===========================================================
+  # helpers
+  # ===========================================================
+  def evaluate(js)
+    run_ui { @browser.evaluate(js) }
+  end
+
+  def read_html
+    evaluate("return document.documentElement.outerHTML;")
+  end
 end
 
 module Frontend
@@ -631,11 +598,5 @@ module Frontend
     end
   end
 
-  at_exit do
-    # Event loop
-    while !$shell.disposed?
-      $display.sleep unless $display.read_and_dispatch
-    end
-    $display.dispose  
-  end
+
 end

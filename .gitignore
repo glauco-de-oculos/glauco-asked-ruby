@@ -8,3 +8,5 @@ maven-mvnd-1.0.2-windows-amd64/
 lmstudio_node_script.js
 progress/
 app.rb
+glauco/models/*.*
+glauco/llamacpp/*.*

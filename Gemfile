@@ -12,6 +12,8 @@ platforms :jruby do
   gem "roo"
   gem "nodo", "~> 1.8"
 
+  gem "llm"
+
   gem "ruby_llm", ">= 1.6.0"
   gem "faraday", "~> 2.9"
 

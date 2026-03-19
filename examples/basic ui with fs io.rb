@@ -1,7 +1,7 @@
-require_relative '../glauco-framework'
+require_relative '../glauco-framework/glauco-framework'
 include Frontend
 
-class Contador < Component
+class Contador < Frontend::Component
   def initialize(parent_renderer:)
     super(parent_renderer: parent_renderer)
 
