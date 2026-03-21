@@ -226,14 +226,223 @@ class GUIShell < GlaucoLLM
 end
 
 module Frontend
+  DEBUG = true
+
+  def debug_log(msg)
+    puts "[DEBUG] #{msg}" if DEBUG
+  end
+
+  require 'java'
+  require 'set'
+  require 'webrick'
+
+  root = File.expand_path('./public')
+  node_modules = File.expand_path('./node_modules')
+
+  WEBrick::HTTPUtils::DefaultMimeTypes['js'] = 'application/javascript'
+
+  server = WEBrick::HTTPServer.new(
+    Port: 8000,
+    DocumentRoot: root,
+    AccessLog: [],
+    Logger: WEBrick::Log.new(nil, 0)
+  )
+
+  server.mount('/node_modules', WEBrick::HTTPServlet::FileHandler, node_modules)
+
+  require 'uri'
+
+  server.mount_proc '/files' do |req, res|
+    raw_path = req.path.sub('/files/', '')
+
+    # 🔥 decode URL (%20, %C3%8D, etc)
+    decoded = URI.decode_www_form_component(raw_path)
+
+    # 🔥 normalizar path windows
+    full_path = decoded
+
+    puts "[FILES] raw=#{raw_path}"
+    puts "[FILES] decoded=#{decoded}"
+    puts "[FILES] full_path=#{full_path}"
+
+    if File.exist?(full_path)
+      res.body = File.binread(full_path)
+      res['Content-Type'] =
+        WEBrick::HTTPUtils.mime_type(full_path, WEBrick::HTTPUtils::DefaultMimeTypes)
+    else
+      puts "[FILES] NOT FOUND"
+      res.status = 404
+      res.body = "Not found"
+    end
+  end
+
+  # ===========================================================
+  # 🔥 Carbon Registry
+  # ===========================================================
+module CarbonRegistry
+  require 'json'
+  require 'set'
+
+  DEBUG = true
+
+  def self.log(msg)
+    puts "[CarbonRegistry] #{msg}" if DEBUG
+  end
+
+  @css_src = "/node_modules/@carbon/styles/css/styles.css"
+  @js_src  = "/carbon.js"
+
+  HTML_TAGS = Set.new(%w[
+    html head body title meta link style script
+    div span p a
+    form label fieldset legend
+    ul ol li
+    main section article aside footer
+    table thead tbody tr th td
+    h1 h2 h3 h4 h5 h6
+    br hr
+    svg path
+  ])
+
+  @available_tags = Set.new
+  @map = {}
+
+  class << self
+    attr_accessor :css_src, :js_src
+    attr_reader :available_tags, :map
+  end
+
+  # ===========================================================
+  # 🔥 LOAD COM DEBUG TOTAL
+  # ===========================================================
+  def self.load!
+    json_path = File.expand_path("./node_modules/@carbon/web-components/custom-elements.json")
+
+    log "loading from: #{json_path}"
+
+    unless File.exist?(json_path)
+      log "❌ custom-elements.json NOT FOUND"
+      return
+    end
+
+    data = JSON.parse(File.read(json_path))
+
+    log "json keys: #{data.keys}"
+
+    @available_tags = Set.new
+    @map = {}
+
+    tags =
+      if data["modules"]
+        log "using modules[] format"
+        data["modules"].flat_map { |m| m["declarations"] || [] }
+          .map { |d| d["tagName"] || d["tag"] }
+      elsif data["declarations"]
+        log "using declarations[] root format"
+        data["declarations"].map { |d| d["tagName"] || d["tag"] }
+      elsif data["tags"]
+        log "using tags[] format"
+        data["tags"].map { |t| t["name"] }
+      else
+        log "❌ unknown format"
+        []
+      end
+
+    log "total raw tags: #{tags.size}"
+
+    tags.each do |tag|
+      next unless tag
+      next unless tag.start_with?("cds-")
+
+      @available_tags << tag
+
+      base = tag.sub(/^cds-/, '').tr('-', '_')
+      @map[base] = tag
+
+      log "mapped: #{base} → #{tag}"
+    end
+
+    log "✔ total mapped: #{@map.size}"
+
+    if @map.empty?
+      log "❌ MAP EMPTY — parsing falhou"
+    end
+  end
+
+  # ===========================================================
+  # 🔥 RESOLVE COM DEBUG
+  # ===========================================================
+  def self.resolve(ruby_name)
+    name = ruby_name.to_s
+
+    log "resolve called: #{name}"
+
+    # HTML
+    if HTML_TAGS.include?(name)
+      log "→ html tag passthrough"
+      return name
+    end
+
+    # cds_
+    if name.start_with?("cds_")
+      tag = name.tr('_', '-')
+      if @available_tags.include?(tag)
+        log "→ cds direct hit: #{tag}"
+        return tag
+      else
+        log "⚠ cds_ not found in available_tags: #{tag}"
+        return name
+      end
+    end
+
+    # DSL
+    if @map[name]
+      log "→ mapped: #{@map[name]}"
+      return @map[name]
+    end
+
+    log "⚠ MISS: #{name}"
+    name
+  end
+
+  # ===========================================================
+  # HTML
+  # ===========================================================
+  def self.script_tag
+    log "injecting script: #{@js_src}"
+    %(<script type="module" src="#{@js_src}"></script>)
+  end
+
+  def self.style_tag
+    log "injecting css: #{@css_src}"
+    %(<link rel="stylesheet" href="#{@css_src}">)
+  end
+
+  def self.defined_style_tag
+    <<~HTML
+      <style>
+        cds-*:not(:defined) {
+          visibility: hidden;
+        }
+      </style>
+    HTML
+  end
+end
+
+  CarbonRegistry.load!
+
+
+  # ===========================================================
+  # 🔥 Browser callbacks
+  # ===========================================================
   $callbacks = {}
+
   def browserFunctionFac(callback_name)
     Class.new(Java::OrgEclipseSwtBrowser::BrowserFunction) do
       define_method(:function) do |*args|
         begin
           arg = args.first
           arg = arg[0] if arg.is_a?(Java::JavaLang::Object[]) && arg.size == 1
-          puts "#{callback_name} called with #{arg.inspect}"
           $callbacks[callback_name].call(arg)
         rescue => e
           puts "Error in callback #{callback_name}: #{e.class} - #{e.message}"
@@ -242,61 +451,72 @@ module Frontend
     end.new($browser, callback_name)
   end
 
-  def getClipBoardText
-    java.awt.Toolkit.getDefaultToolkit.getspawnClipboard.getData(
-      java.awt.datatransfer.DataFlavor.stringFlavor
-    )
-  end
-
+  # ===========================================================
+  # 🔥 Root Renderer
+  # ===========================================================
   class RootRenderer
-    attr_accessor :browser, :callbacks, :root_component
+    attr_accessor :browser, :root_component
 
     def initialize(browser)
       @browser = browser
     end
-    
+
     def bind_callback(event, proc_obj)
       callback_name = "callback_#{rand(1000..9999)}"
       $callbacks[callback_name] = proc_obj
-      if @browser
-        browserFunctionFac(callback_name)
+      browserFunctionFac(callback_name)
+
+      attr = event.to_s.gsub('_', '')
+
+      if attr == "onclick"
+        %(onclick="event.preventDefault(); event.stopPropagation(); #{callback_name}(this.value); return false;")
+      else
+        %(#{attr}="#{callback_name}(this.value)")
       end
-
-      # Retorna o atributo HTML correto
-      "#{event.to_s.gsub('_', '')}=\"#{callback_name}(this.value)\""
     end
+
     def render
-      puts "calling render"
+      puts "[RootRenderer.render] full render" if DEBUG
       return unless @root_component
-      puts "passed root_component condition"
-      puts "now will call browser.set_text"
-      @browser.set_text(@root_component.render_to_html)
-    end
 
-    def update_dom(placeholder_id, new_html)
-      # garanta string
-      html_str = new_html.is_a?(String) ? new_html : Array(new_html).join
-      puts "updated dom #{placeholder_id}"
-      puts "html_str: #{html_str}"
-      js = <<~JS
-        (function(){
-          var el = document.getElementById("#{placeholder_id}");
-          if (el) {
-            el.innerHTML = #{html_str.to_json};
-          }
-        })();
-      JS
-      @browser.evaluate(js)
+      body_html = @root_component.render_to_html
+
+      html = <<~HTML
+        <!DOCTYPE html>
+        <html theme="g100">
+          <head>
+            <meta charset="UTF-8">
+            #{CarbonRegistry.style_tag}
+            #{CarbonRegistry.script_tag}
+            #{CarbonRegistry.defined_style_tag}
+            <style>
+              html, body {
+                margin: 0;
+                padding: 0;
+                height: 100%;
+              }
+            </style>
+          </head>
+          <body class="cds-theme-zone-g100">
+            #{body_html}
+          </body>
+        </html>
+      HTML
+
+      File.write("public/index.html", html)
     end
   end
 
+  # ===========================================================
+  # 🔥 Component DSL
+  # ===========================================================
   class Component
     attr_accessor :state, :children, :parent_renderer, :attrs
 
     def initialize(parent_renderer: nil, **attrs)
-      puts "initilizing component"
+      puts "initilizing component" if DEBUG
       @state = {}
-      @bindings = []
+      @bindings = {}
       @children = []
       @parent_renderer = parent_renderer
       @event_listeners = {}
@@ -318,14 +538,12 @@ module Frontend
     end
 
     def add_event_listener(event_name, &callback)
-      callback_name = "callback_#{$callbacks.length+1}"
+      callback_name = "callback_#{$callbacks.length + 1}"
       $callbacks[callback_name] = callback
-      if @parent_renderer&.browser
-        browserFunctionFac(callback_name)
-      end
+      browserFunctionFac(callback_name) if @parent_renderer&.browser
+      callback_name
     end
-    
-    # Define o método _ que inicializa um StatePath a partir de Symbol
+
     class Symbol
       def >(other)
         sp = StatePath.new(self)
@@ -333,7 +551,6 @@ module Frontend
       end
     end
 
-    # Classe StatePath
     class StatePath
       def initialize(base)
         @parts = [base.to_s]
@@ -344,77 +561,67 @@ module Frontend
         self
       end
 
+      def append_part(part)
+        @parts << part.to_s
+        self
+      end
+
       def to_s
         first, *rest = @parts
         rest.reduce(first) { |acc, part| "#{acc}[#{part}]" }
       end
     end
 
-    # --- Bindings avançados ---
+    def render_binding_result(result)
+      case result
+      when Array
+        result.map { |r| r.respond_to?(:render_to_html) ? r.render_to_html : r.to_s }.join("\n")
+      when Component
+        result.render_to_html
+      else
+        result.to_s
+      end
+    end
+
     def bind(state_key, node, &block)
-      # garante que sempre temos um StatePath
-      puts "binding #{state_key} to node #{node}"
       state_path = state_key.is_a?(StatePath) ? state_key : StatePath.new(state_key)
-
       path_str = state_path.to_s
-      puts "path_str: #{path_str}"
 
-      # injeta data-bind no HTML
-      node = node.sub(/<(\w+)([^>]*)>/, "<\\1\\2 data-bind=\"#{path_str}\">")
-      # puts "node after data-bind injection: #{node}"
+      node_html = node.to_s
+      node_html = node_html.sub(
+        /<([a-zA-Z0-9\-_]+)([^>]*)>/,
+        '<\1\2 data-bind="' + path_str + '">'
+      )
 
-      # registra o binding
-      @bindings << { path: state_path, key: path_str, block: block }
-      puts "registered bindings: #{@bindings}"
+      @bindings[path_str] = { path: state_path, key: path_str, block: block }
 
-      # busca valor atual
       value = dig_state_path(state_path)
-      puts "current value for #{path_str}: #{value.inspect}"
 
       begin
-        puts "current value for #{path_str}: #{value.inspect}"
-        result = block.call(value)
-
-        inner_html =
-          case result
-          when Array
-            result.map { |r| r.is_a?(Component) ? r.render_to_html : r.to_s }.join
-          when Component
-            result.render_to_html
-          else
-            result.to_s
-          end
+        inner_html = render_binding_result(block.call(value))
       rescue => e
         puts "⚠️ Erro ao executar binding para #{path_str}: #{e.class} - #{e.message}"
         inner_html = ""
       end
 
-      # puts "inner_html: #{inner_html}"
-      node = node.sub(%r{</\w+>}, inner_html + '\0')
-      puts "node after inner_html injection: #{node}"
-
-      node
+      node_html.sub(%r{</[a-zA-Z0-9\-_]+>}, inner_html + '\0')
     end
 
     def dig_state_path(state_path)
-      puts "dig_state_path called with #{state_path}"
       parts = state_path.to_s.scan(/([^\[\]]+)/).flatten
+
       parts.reduce(@state) do |obj, key|
         break nil if obj.nil?
 
         if obj.is_a?(Array)
-          puts "Accessing array with key #{key}"
-          idx = key.to_i rescue nil
+          idx = Integer(key, exception: false)
           break nil if idx.nil?
           obj[idx]
         elsif obj.is_a?(Hash)
-          puts "Accessing hash with key #{key}"
           key_sym = key.to_sym
           if obj.key?(key_sym)
-            puts "Found key #{key_sym} in hash"
             obj[key_sym]
           elsif obj.key?(key)
-            puts "Found key #{key} in hash"
             obj[key]
           else
             nil
@@ -425,129 +632,112 @@ module Frontend
       end
     end
 
-    # --- Atualização de estado com paths complexos ---
     def set_state(path, new_value)
       path_str = path.is_a?(StatePath) ? path.to_s : path.to_s
-      puts "set_state called with path #{path_str} and value #{new_value.inspect}"
 
-      parts = path_str.split(/[:\[\]]/).reject(&:empty?)
+      parts = path_str.scan(/([^\[\]]+)/).flatten
       last_key = parts.pop
+
       target = parts.reduce(@state) do |obj, key|
-        if obj[key.to_sym].nil?
-          obj[key.to_sym] = {}
-        end
-        obj[key.to_sym]
+        key_sym = key.to_sym
+        obj[key_sym] ||= {}
+        obj[key_sym]
       end
 
       target[last_key.to_sym] = new_value
-
-      notify_bindings(path)
+      notify_bindings(path_str)
     end
 
-    # --- Notificação de bindings ---
     def notify_bindings(path)
       path_str = path.is_a?(StatePath) ? path.to_s : path.to_s
-      puts "notify_bindings called for path #{path_str}"
+      puts "notify_bindings called for path #{path_str}" if DEBUG
 
-      @bindings.each do |binding|
-        binding_path_str = binding[:path].to_s
+      binding = @bindings[path_str]
 
-        # verifica se binding é afetado: match exato ou prefixo
-        if path_str == binding_path_str || binding_path_str.start_with?("#{path_str}:") || binding_path_str.start_with?("#{path_str}[")
-          value = dig_state_path(binding[:path])
-          puts "Binding found for #{binding_path_str}, updating DOM with value: #{value.inspect}"
+      puts binding.inspect
 
-          begin
-            puts "Calling binding block for #{binding_path_str} with value #{value.inspect}"
-            result = binding[:block].call(value)
-            puts "Binding block result for #{binding_path_str}: #{result.to_s}"
+      return path_str unless binding
 
-            # Garante que sempre teremos string
-            inner_html =
-              case result
-              when Array
-                result.map { |r| r.is_a?(Component) ? r.render_to_html : r.to_s }.join
-              when Component
-                result.render_to_html
-              else
-                result.to_s
-              end
-          rescue => e
-            puts "⚠️ Erro ao renderizar binding #{binding_path_str}: #{e.class} - #{e.message}"
-            inner_html = ""
-          end
+      puts binding.inspect
 
-          # puts "Generated inner_html for #{binding_path_str}: #{inner_html.inspect}"
+      value = dig_state_path(binding[:path])
 
-          js = <<~JS
-            (() => {
-              const el = document.querySelector('[data-bind="#{binding_path_str}"]');
-              if (el) el.innerHTML = #{inner_html.to_json};
-            })();
-          JS
+      puts value.inspect
 
-          res = @parent_renderer.browser.execute(js)
-
-          puts "DOM updated for binding #{binding_path_str}"
-        end
+      begin
+        puts "Binding found for #{path_str}, updating DOM with value: #{value.inspect}" if DEBUG
+        inner_html = render_binding_result(binding[:block].call(value))
+      rescue => e
+        puts "⚠️ Erro ao renderizar binding #{path_str}: #{e.class} - #{e.message}"
+        inner_html = ""
       end
+
+      js = <<~JS
+        (() => {
+          const nodes = document.querySelectorAll('[data-bind="#{path_str}"]');
+          nodes.forEach(el => {
+            el.innerHTML = #{inner_html.to_json};
+          });
+        })();
+      JS
+
+      @parent_renderer.browser.execute(js)
       path_str
     end
 
     public
+
     def add_child(comp)
-      comp.parent_renderer = self.parent_renderer
-      puts "comp.inspect: #{comp.inspect}"
+      comp.parent_renderer = parent_renderer
       @children << comp
     end
 
     def method_missing(method_name, *args, **kwargs, &block)
-      tag(method_name, *args, **kwargs, &block)
+      name = method_name.to_s
+      tag(CarbonRegistry.resolve(name), *args, **kwargs, &block)
     end
 
-    def respond_to_missing?(method_name, include_private = false)
+    def respond_to_missing?(_method_name, _include_private = false)
       true
     end
 
     def tag(name, *args, **attrs, &block)
-      puts "tag called with name #{name}, args #{args.inspect}, attrs #{attrs.inspect}"
+      resolved_name = CarbonRegistry.resolve(name)
+
       content_or_attrs = args.first
 
-      inner_content = if block
-        result = instance_eval(&block)
+      inner_content =
+        if block
+          result = instance_eval(&block)
+          components = result.is_a?(Array) ? result : [result]
 
-        # Normaliza para array
-        components = result.is_a?(Array) ? result : [result]
-
-        # Adiciona cada filho e renderiza
-        components.map do |c|
-          add_child(c) if c.is_a?(Component)
-          c.is_a?(Component) ? c.render_to_html : c.to_s
-        end.join
-      else
-        content_or_attrs.is_a?(Component ) ? content_or_attrs.render_to_html : content_or_attrs.to_s
-      end
+          components.map do |c|
+            add_child(c) if c.is_a?(Component)
+            c.is_a?(Component) ? c.render_to_html : c.to_s
+          end.join
+        else
+          content_or_attrs.is_a?(Component) ? content_or_attrs.render_to_html : content_or_attrs.to_s
+        end
 
       html_attrs = attrs.map do |k, v|
+        attr_name = k.to_s.tr('_', '-')
+
         if k.to_s.start_with?("on") && v.is_a?(Proc)
           @parent_renderer.bind_callback(k, v)
+        elsif v == true
+          attr_name
+        elsif v == false || v.nil?
+          nil
         else
-          "#{k}=\"#{v}\""
+          "#{attr_name}=\"#{v}\""
         end
-      end.join(" ")
+      end.compact.join(" ")
 
-      @event_listeners.each do |event, proc_obj|
-        html_attrs += " #{add_event_listener(event, &proc_obj)}"
+      if html_attrs.empty?
+        "<#{resolved_name}>#{inner_content}</#{resolved_name}>"
+      else
+        "<#{resolved_name} #{html_attrs}>#{inner_content}</#{resolved_name}>"
       end
-
-      @attrs.each do |k, v|
-        html_attrs += "#{k}=\"#{v}\""
-      end
-
-      res = "<#{name} #{html_attrs}>#{inner_content}</#{name}>"
-
-      # puts "Generated HTML for tag #{name}: #{res}"
-      res
     end
 
     def p(*args, **attrs, &block)
@@ -555,10 +745,10 @@ module Frontend
     end
 
     def render_to_html
+      @children = []
       return "" unless @render_block
       instance_eval(&@render_block).to_s
     end
-
 
     def ui(&block)
       @render_block = block
@@ -577,26 +767,43 @@ module Frontend
     end
 
     def rerender
-      puts "called"
+      puts "rerenderrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
       @parent_renderer.render
     end
   end
 
   def +(other)
-    self.render_to_html + (other.is_a?(Component) ? other.render_to_html : other.to_s)
+    left = respond_to?(:render_to_html) ? render_to_html : to_s
+    right = other.is_a?(Component) ? other.render_to_html : other.to_s
+    left + right
   end
-
-  $display = Display.new
-  $shell = Shell.new($display)
-  $shell.setLayout(FillLayout.new)
-  $browser = Browser.new($shell, 0)
-  $root = Frontend::RootRenderer.new($browser)
 
   def async(&block)
-    $display.async_exec do
-      block.call
-    end
+    $display.async_exec { block.call }
   end
 
+
+  $display = Display.new
+  $shell   = Shell.new($display)
+  $shell.setLayout(FillLayout.new)
+
+  $browser = Browser.new($shell, 0)
+  $root    = RootRenderer.new($browser)
+  
+  Thread.new { server.start }
+
+  def self.start!
+    $display.async_exec do
+      $browser.setUrl("http://localhost:8000/index.html")
+    end
+
+    run_loop
+  end
+  	def run_loop
+		while !$shell.disposed?
+			$display.sleep unless $display.read_and_dispatch
+		end
+    $display.dispose
+  	end
 
 end

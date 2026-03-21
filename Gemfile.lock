@@ -5,7 +5,6 @@ GEM
     afm (0.2.2)
     base64 (0.3.0)
     bigdecimal (3.3.1-java)
-    coderay (1.1.3)
     csv (3.3.5)
     docx (0.10.0)
       nokogiri (~> 1.13, >= 1.13.0)
@@ -21,14 +20,11 @@ GEM
       net-http (~> 0.5)
     faraday-retry (2.3.2)
       faraday (~> 2.0)
-    ffi (1.17.2-java)
     fileutils (1.8.0)
     hashery (2.1.2)
-    jruby-openssl (0.15.5-java)
     json (2.16.0-java)
     logger (1.7.0)
     marcel (1.1.0)
-    method_source (1.1.0)
     multipart-post (2.4.1)
     net-http (0.7.0)
       uri
@@ -44,10 +40,6 @@ GEM
       hashery (~> 2.0)
       ruby-rc4
       ttfunk
-    pry (0.15.2-java)
-      coderay (~> 1.1)
-      method_source (~> 1.0)
-      spoon (~> 0.0)
     racc (1.8.1-java)
     roo (3.0.0)
       base64 (~> 0.2)
@@ -72,8 +64,6 @@ GEM
     ruby_llm-schema (0.2.1)
     rubyzip (3.2.2)
     securerandom (0.4.1)
-    spoon (0.0.6)
-      ffi
     ttfunk (1.8.0)
       bigdecimal (~> 3.1)
     uri (1.1.1)
@@ -86,16 +76,13 @@ PLATFORMS
 
 DEPENDENCIES
   docx
-  faraday (~> 2.9)
   fileutils
-  jruby-openssl
   json
   logger
   nodo (~> 1.8)
   observer
   open3
   pdf-reader
-  pry
   roo
   rubyXL (~> 3.4)
   ruby_llm (>= 1.6.0)
