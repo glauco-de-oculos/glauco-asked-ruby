@@ -1,0 +1,10 @@
+platforms :jruby do
+  gem "logger"
+  gem "observer"
+  gem "pdf-reader"
+  gem "docx"
+  gem "roo"
+  gem "rubyXL", "~> 3.4"
+  gem "nodo", "~> 1.8"
+  gem "webrick"
+end

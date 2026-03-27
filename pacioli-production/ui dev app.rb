@@ -1,4 +1,4 @@
-require_relative '../glauco-framework/glauco-framework'
+require_relative '../core/framework/glauco-framework'
 
 include Frontend
 

@@ -1,8 +1,14 @@
 Encoding.default_external = Encoding::UTF_8
 Encoding.default_internal = Encoding::UTF_8
 
+PROJECT_ROOT = File.expand_path("../..", __dir__) unless defined?(PROJECT_ROOT)
+JARLIBS_DIR = File.join(PROJECT_ROOT, "jarlibs") unless defined?(JARLIBS_DIR)
+PUBLIC_DIR = File.join(PROJECT_ROOT, "public") unless defined?(PUBLIC_DIR)
+FRAMEWORK_WEB_DIR = File.join(__dir__, "web") unless defined?(FRAMEWORK_WEB_DIR)
+NODE_MODULES_DIR = File.join(FRAMEWORK_WEB_DIR, "node_modules") unless defined?(NODE_MODULES_DIR)
+
 require 'java'
-require './jarlibs/swt.jar'
+require File.join(JARLIBS_DIR, 'swt.jar')
 
 java_import 'org.eclipse.swt.widgets.Display'
 java_import 'org.eclipse.swt.widgets.Shell'
@@ -50,7 +56,7 @@ class WebAction
   end
 end
 
-require_relative '../glauco/GlaucoLLM'
+require_relative '../llm/GlaucoLLM'
 
 puts "[GlaucoWebshell] 🚀 Definindo classe GlaucoWebshell..."
 
@@ -227,6 +233,7 @@ end
 
 module Frontend
   DEBUG = true
+  DEFAULT_PORT = (ENV["GLAUCO_PORT"] || "8000").to_i
 
   def debug_log(msg)
     puts "[DEBUG] #{msg}" if DEBUG
@@ -236,17 +243,45 @@ module Frontend
   require 'set'
   require 'webrick'
 
-  root = File.expand_path('./public')
-  node_modules = File.expand_path('./node_modules')
+  root = PUBLIC_DIR
+  node_modules = NODE_MODULES_DIR
+  @server_port = DEFAULT_PORT
 
   WEBrick::HTTPUtils::DefaultMimeTypes['js'] = 'application/javascript'
 
+  def self.port_available?(port)
+    TCPServer.new('127.0.0.1', port).close
+    true
+  rescue Errno::EADDRINUSE, Errno::EACCES
+    false
+  end
+
+  def self.resolve_server_port(preferred_port = DEFAULT_PORT)
+    port = preferred_port.to_i
+    50.times do
+      return port if port_available?(port)
+      port += 1
+    end
+
+    raise "Nenhuma porta disponivel encontrada a partir de #{preferred_port}"
+  end
+
+  @server_port = resolve_server_port(@server_port)
+
   server = WEBrick::HTTPServer.new(
-    Port: 8000,
+    Port: @server_port,
     DocumentRoot: root,
     AccessLog: [],
     Logger: WEBrick::Log.new(nil, 0)
   )
+
+  def self.server_port
+    @server_port
+  end
+
+  def self.base_url
+    "http://localhost:#{@server_port}"
+  end
 
   server.mount('/node_modules', WEBrick::HTTPServlet::FileHandler, node_modules)
 
@@ -316,7 +351,7 @@ module CarbonRegistry
   # 🔥 LOAD COM DEBUG TOTAL
   # ===========================================================
   def self.load!
-    json_path = File.expand_path("./node_modules/@carbon/web-components/custom-elements.json")
+    json_path = File.join(NODE_MODULES_DIR, "@carbon", "web-components", "custom-elements.json")
 
     log "loading from: #{json_path}"
 
@@ -503,7 +538,7 @@ end
         </html>
       HTML
 
-      File.write("public/index.html", html)
+      File.write(File.join(PUBLIC_DIR, "index.html"), html)
     end
   end
 
@@ -517,6 +552,12 @@ end
       puts "initilizing component" if DEBUG
       @state = {}
       @bindings = {}
+      @effects = []
+      @effect_sequence = 0
+      @pending_effect_ids = Set.new
+      @active_effect_ids = Set.new
+      @effect_batch_depth = 0
+      @is_flushing_effects = false
       @children = []
       @parent_renderer = parent_renderer
       @event_listeners = {}
@@ -608,7 +649,7 @@ end
     end
 
     def dig_state_path(state_path)
-      parts = state_path.to_s.scan(/([^\[\]]+)/).flatten
+      parts = normalize_state_path(state_path).scan(/([^\[\]]+)/).flatten
 
       parts.reduce(@state) do |obj, key|
         break nil if obj.nil?
@@ -632,8 +673,40 @@ end
       end
     end
 
-    def set_state(path, new_value)
-      path_str = path.is_a?(StatePath) ? path.to_s : path.to_s
+    def effect(deps, immediate: true, run_on_init: true, &block)
+      dep_paths = Array(deps).map { |dep| normalize_state_path(dep) }
+      raise ArgumentError, "effect precisa de pelo menos uma dependencia" if dep_paths.empty?
+      raise ArgumentError, "effect precisa de um bloco" unless block
+
+      @effect_sequence += 1
+      effect = {
+        id: @effect_sequence,
+        deps: dep_paths,
+        immediate: immediate,
+        block: block
+      }
+
+      @effects << effect
+      run_effect(effect) if run_on_init
+      effect
+    end
+
+    def batch(&block)
+      @effect_batch_depth += 1
+      block.call
+    ensure
+      @effect_batch_depth -= 1
+      flush_pending_effects if @effect_batch_depth.zero?
+    end
+
+    def commit(&block)
+      return batch(&block) if block_given?
+
+      flush_pending_effects
+    end
+
+    def set_state(path, new_value, replace: false)
+      path_str = normalize_state_path(path)
 
       parts = path_str.scan(/([^\[\]]+)/).flatten
       last_key = parts.pop
@@ -644,12 +717,23 @@ end
         obj[key_sym]
       end
 
-      target[last_key.to_sym] = new_value
+      last_key_sym = last_key.to_sym
+      current_value = target[last_key_sym]
+
+      target[last_key_sym] =
+        if !replace && current_value.is_a?(Hash) && new_value.is_a?(Hash)
+          current_value.merge(new_value)
+        else
+          new_value
+        end
+
       notify_bindings(path_str)
+      schedule_effects(path_str)
+      flush_pending_effects if @effect_batch_depth.zero?
     end
 
     def notify_bindings(path)
-      path_str = path.is_a?(StatePath) ? path.to_s : path.to_s
+      path_str = normalize_state_path(path)
       puts "notify_bindings called for path #{path_str}" if DEBUG
 
       binding = @bindings[path_str]
@@ -681,8 +765,61 @@ end
         })();
       JS
 
-      @parent_renderer.browser.execute(js)
+      @parent_renderer&.browser&.execute(js)
       path_str
+    end
+
+    private
+
+    def normalize_state_path(path)
+      path.is_a?(StatePath) ? path.to_s : path.to_s
+    end
+
+    def schedule_effects(changed_path)
+      @effects.each do |registered_effect|
+        next unless registered_effect[:deps].any? { |dep| related_state_paths?(dep, changed_path) }
+
+        if registered_effect[:immediate]
+          run_effect(registered_effect)
+        else
+          @pending_effect_ids.add(registered_effect[:id])
+        end
+      end
+    end
+
+    def flush_pending_effects
+      return if @is_flushing_effects
+      return if @pending_effect_ids.empty?
+
+      @is_flushing_effects = true
+
+      loop do
+        pending_ids = @pending_effect_ids.to_a
+        @pending_effect_ids.clear
+        break if pending_ids.empty?
+
+        pending_ids.each do |effect_id|
+          registered_effect = @effects.find { |effect| effect[:id] == effect_id }
+          run_effect(registered_effect) if registered_effect
+        end
+      end
+    ensure
+      @is_flushing_effects = false
+    end
+
+    def run_effect(registered_effect)
+      return unless registered_effect
+      return if @active_effect_ids.include?(registered_effect[:id])
+
+      @active_effect_ids.add(registered_effect[:id])
+      values = registered_effect[:deps].map { |dep| dig_state_path(dep) }
+      registered_effect[:block].call(*values)
+    ensure
+      @active_effect_ids.delete(registered_effect[:id]) if registered_effect
+    end
+
+    def related_state_paths?(left, right)
+      left == right || left.start_with?("#{right}[") || right.start_with?("#{left}[")
     end
 
     public
@@ -793,17 +930,18 @@ end
   Thread.new { server.start }
 
   def self.start!
+    $shell.open
     $display.async_exec do
-      $browser.setUrl("http://localhost:8000/index.html")
+      $browser.setUrl("#{base_url}/index.html")
     end
-
     run_loop
   end
-  	def run_loop
+  
+  def run_loop
 		while !$shell.disposed?
 			$display.sleep unless $display.read_and_dispatch
 		end
     $display.dispose
-  	end
+  end
 
 end

@@ -1,6 +1,8 @@
 {
-  "dependencies": {
-    "@carbon/web-components": "^2.50.0",
-    "esbuild": "^0.27.4"
+  "name": "glauco-workspace",
+  "private": true,
+  "scripts": {
+    "web:install": "npm --prefix core/framework/web install",
+    "web:build": "npm --prefix core/framework/web run build:carbon"
   }
 }

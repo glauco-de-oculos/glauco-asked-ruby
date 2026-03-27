@@ -1,6 +1,6 @@
 vendor/
 LMSLLM_integration.rb
-node_modules/
+core/framework/web/node_modules/
 .clj-kondo/
 .idea/
 .lsp/
@@ -8,6 +8,9 @@ maven-mvnd-1.0.2-windows-amd64/
 lmstudio_node_script.js
 progress/
 app.rb
-models/*.*
-llamacpp/*.*
+core/models/*.*
+core/llamacpp/*.*
 *.jar
+runtime
+floating-chat-app.err.log
+floating-chat-app.out.log

@@ -351,7 +351,7 @@ module RLM
     end
 
     def clean_utf8(s)
-      s.to_s.force_encoding("UTF-8")
+      s.to_s.dup.force_encoding("UTF-8")
         .encode("UTF-8", invalid: :replace, undef: :replace, replace: "")
     end
   end

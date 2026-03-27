@@ -1,0 +1,8 @@
+source "https://rubygems.org"
+
+platforms :jruby do
+  gem "json"
+end
+
+eval_gemfile File.expand_path("framework/Gemfile", __dir__)
+eval_gemfile File.expand_path("llm/Gemfile", __dir__)

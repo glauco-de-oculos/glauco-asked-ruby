@@ -4,6 +4,7 @@ GEM
     Ascii85 (2.0.1)
     afm (0.2.2)
     base64 (0.3.0)
+    bigdecimal (3.3.1)
     bigdecimal (3.3.1-java)
     csv (3.3.5)
     docx (0.10.0)
@@ -25,11 +26,15 @@ GEM
     json (2.16.0-java)
     logger (1.7.0)
     marcel (1.1.0)
+    mini_portile2 (2.8.9)
     multipart-post (2.4.1)
     net-http (0.7.0)
       uri
     nodo (1.8.1)
       logger
+    nokogiri (1.18.10)
+      mini_portile2 (~> 2.8.2)
+      racc (~> 1.4)
     nokogiri (1.18.10-java)
       racc (~> 1.4)
     observer (0.1.2)
@@ -40,6 +45,7 @@ GEM
       hashery (~> 2.0)
       ruby-rc4
       ttfunk
+    racc (1.8.1)
     racc (1.8.1-java)
     roo (3.0.0)
       base64 (~> 0.2)
@@ -67,12 +73,14 @@ GEM
     ttfunk (1.8.0)
       bigdecimal (~> 3.1)
     uri (1.1.1)
+    webrick (1.9.2)
     zeitwerk (2.6.18)
 
 PLATFORMS
   universal-java-17
   universal-java-21
   universal-java-8
+  x64-mingw-ucrt
 
 DEPENDENCIES
   docx
@@ -87,6 +95,7 @@ DEPENDENCIES
   rubyXL (~> 3.4)
   ruby_llm (>= 1.6.0)
   securerandom
+  webrick
 
 BUNDLED WITH
    2.6.9
