@@ -1,4 +1,4 @@
-require_relative '../../core/llm/GlaucoLLM'
+require_relative '../../core/framework/glauco-framework'
 
 class FloatingChatRuntime
   def app_name(*)
@@ -28,10 +28,11 @@ class FloatingChatAgent < GlaucoLLM
 
   def initialize
     super()
-    setup_llm(system_config_instructions: SYSTEM_CONFIG_PATH)
-    runtime = FloatingChatRuntime.new
-    @agent.instance_variable_set(:@runtime, runtime)
-    @agent.instance_variable_set(:@runtime_methods, runtime.public_methods(false).map(&:to_s))
+
+    bootstrap_agent!(
+      system_config_instructions: SYSTEM_CONFIG_PATH,
+      runtime: FloatingChatRuntime.new
+    )
   end
 end
 

@@ -12,6 +12,8 @@ require File.join(JARLIBS_DIR, 'swt.jar')
 
 java_import 'org.eclipse.swt.widgets.Display'
 java_import 'org.eclipse.swt.widgets.Shell'
+java_import 'org.eclipse.swt.widgets.Composite'
+java_import 'org.eclipse.swt.widgets.Listener'
 java_import 'org.eclipse.swt.layout.FillLayout'
 java_import 'org.eclipse.swt.browser.Browser'
 java_import 'org.eclipse.swt.browser.BrowserFunction'
@@ -60,11 +62,114 @@ require_relative '../llm/GlaucoLLM'
 
 puts "[GlaucoWebshell] 🚀 Definindo classe GlaucoWebshell..."
 
+module GlaucoFramework
+  module LLMBootstrap
+    def bootstrap_agent!(system_config_instructions:, domain_specific_knowledge: nil, runtime: nil, capability_schema: nil, extra_vars: {})
+      puts "[LLM] 🚀 bootstrap_agent! (framework bootstrap)"
+
+      @config_path = File.expand_path(system_config_instructions)
+      @domain_specific_knowledge = domain_specific_knowledge && File.expand_path(domain_specific_knowledge)
+
+      initial_vars = load_bootstrap_vars(
+        config_path: @config_path,
+        knowledge_path: @domain_specific_knowledge,
+        capability_schema: capability_schema,
+        extra_vars: extra_vars
+      )
+
+      build_agent(initial_vars: initial_vars, runtime: runtime)
+    end
+
+    def bind_runtime_capabilities!(runtime, capability_schema: nil)
+      attach_runtime(runtime)
+
+      if capability_schema
+        vars["capability_schema"] =
+          capability_schema.is_a?(String) ? capability_schema : JSON.pretty_generate(capability_schema)
+      end
+
+      runtime
+    end
+
+    private
+
+    def load_bootstrap_vars(config_path:, knowledge_path:, capability_schema:, extra_vars:)
+      initial_vars = {}
+
+      unless File.exist?(config_path)
+        raise "system_config_instructions não encontrado: #{config_path}"
+      end
+
+      initial_vars["system_config"] = File.read(config_path, encoding: "UTF-8")
+
+      if knowledge_path && File.exist?(knowledge_path)
+        initial_vars["domain_knowledge"] = File.read(knowledge_path, encoding: "UTF-8")
+      end
+
+      if capability_schema
+        initial_vars["capability_schema"] =
+          capability_schema.is_a?(String) ? capability_schema : JSON.pretty_generate(capability_schema)
+      end
+
+      extra_vars.each do |key, value|
+        initial_vars[key.to_s] = value
+      end
+
+      initial_vars
+    end
+  end
+
+  module ShellCapabilities
+    FRAME_LIMITATION_NOTE = "Frames internos via SWT Browser dependem da engine embutida e de same-origin. O schema abaixo prepara introspeccao e avaliacao em frame quando acessivel."
+
+    module_function
+
+    def schema
+      {
+        shell: {
+          description: "Capacidades do shell SWT para navegacao, DOM e exploracao de frames.",
+          frame_support: {
+            status: "experimental",
+            notes: FRAME_LIMITATION_NOTE,
+            fallback_paths: [
+              "Migrar a camada de shell para Julia + WebViews quando embutir frames for requisito de primeira linha.",
+              "Explorar Tauri + Leptos para manter avaliacao de JavaScript e rotas desktop com melhor controle de webview."
+            ]
+          },
+          capabilities: [
+            capability("open_url", "Abre uma URL no browser principal.", params: %w[url]),
+            capability("current_url", "Retorna a URL atual do browser principal."),
+            capability("eval_js", "Executa JavaScript no documento principal.", params: %w[js]),
+            capability("read_html", "Le o HTML renderizado da janela atual."),
+            capability("list_frames", "Inspeciona frames acessiveis da janela atual."),
+            capability("eval_js_in_frame", "Executa JavaScript em um frame acessivel por indice ou nome.", params: %w[frame_ref js]),
+            capability("frame_support_report", "Resume limites atuais de frames internos no SWT Browser.")
+          ]
+        }
+      }
+    end
+
+    def capability(name, description, params: [])
+      {
+        name: name,
+        description: description,
+        params: params
+      }
+    end
+  end
+end
+
+class GlaucoLLM
+  include GlaucoFramework::LLMBootstrap
+end
+
 class ApiRuntime
-  def initialize(browser:, display:, host:)
+  def initialize(browser:, display:, host:, state:)
     @browser = browser
     @display = display
     @host = host
+    @state = state
+    @capability_schema = GlaucoFramework::ShellCapabilities.schema
   end
 
   def open_url(url)
@@ -74,60 +179,154 @@ class ApiRuntime
     @host.ensure_ui_alive
 
     @host.run_ui do
+      @state[:current_url] = url
+      @state[:last_action] = "open_url"
       @browser.setUrl(url)
     end
 
     "opened #{url}"
   end
 
+  def current_url(*)
+    @state[:current_url].to_s
+  end
+
   def eval_js(js)
+    @state[:last_action] = "eval_js"
+    @host.ensure_ui_alive
     @host.run_ui { @browser.evaluate(js) }
+  end
+
+  def read_html(*)
+    eval_js("return document.documentElement.outerHTML;")
+  end
+
+  def list_frames(*)
+    raw = eval_js(<<~JS)
+      return JSON.stringify((function() {
+        const frames = [];
+        for (let index = 0; index < window.frames.length; index += 1) {
+          const frame = window.frames[index];
+          try {
+            frames.push({
+              index,
+              name: frame.name || null,
+              location: frame.location ? frame.location.href : null,
+              accessible: true
+            });
+          } catch (error) {
+            frames.push({
+              index,
+              name: null,
+              location: null,
+              accessible: false,
+              error: String(error)
+            });
+          }
+        }
+
+        return {
+          count: window.frames.length,
+          frames
+        };
+      })());
+    JS
+
+    JSON.parse(raw.to_s)
+  rescue JSON::ParserError
+    { "count" => 0, "frames" => [], "raw" => raw.to_s }
+  end
+
+  def eval_js_in_frame(frame_ref, js)
+    escaped_frame = frame_ref.to_s.dump
+    escaped_js = js.to_s.dump
+
+    raw = eval_js(<<~JS)
+      return JSON.stringify((function() {
+        const ref = #{escaped_frame};
+        const code = #{escaped_js};
+        let target = null;
+
+        if (/^\\d+$/.test(ref)) {
+          target = window.frames[Number(ref)];
+        } else {
+          target = window.frames[ref];
+        }
+
+        if (!target) {
+          return { ok: false, error: "frame not found", ref };
+        }
+
+        try {
+          const result = target.eval(code);
+          return { ok: true, ref, result };
+        } catch (error) {
+          return { ok: false, ref, error: String(error) };
+        }
+      })());
+    JS
+
+    JSON.parse(raw.to_s)
+  rescue JSON::ParserError
+    { "ok" => false, "ref" => frame_ref.to_s, "error" => raw.to_s }
+  end
+
+  def frame_support_report(*)
+    GlaucoFramework::ShellCapabilities::FRAME_LIMITATION_NOTE
+  end
+
+  def capability_schema(*)
+    @capability_schema
   end
 end
 
 
 class GUIShell < GlaucoLLM
-  attr_reader :shell, :browser, :display
+  attr_reader :shell, :browser, :display, :overlay_shell, :overlay_browser
   attr_accessor :state, :visible
 
   def initialize(visible: false)
     super()
 
     @visible = visible
-    @state = { current_url: nil, last_action: nil, context: {} }
+    @state = {
+      current_url: nil,
+      last_action: nil,
+      context: {},
+      capability_schema: GlaucoFramework::ShellCapabilities.schema,
+      overlay: {
+        visible: false,
+        requested_visible: false,
+        url: nil,
+        alpha: 255,
+        bounds: nil
+      }
+    }
 
     start_ui_thread if @visible
 
-    puts "[GUIShell] BEFORE setup_llm"
+    puts "[GUIShell] BEFORE bootstrap_agent!"
 
-    setup_llm(
+    runtime = build_shell_runtime
+    capability_schema = runtime.capability_schema
+
+    bootstrap_agent!(
       system_config_instructions: File.expand_path("system_config_instructions.md", __dir__),
-      domain_specific_knowledge: File.expand_path("dinamicas diretrizes - prompt.md", __dir__)
+      domain_specific_knowledge: File.expand_path("dinamicas diretrizes - prompt.md", __dir__),
+      runtime: runtime,
+      capability_schema: capability_schema
     )
 
-    puts "[GUIShell] AFTER setup_llm"
-
-    setup_runtime
+    puts "[GUIShell] AFTER bootstrap_agent!"
   end
 
-  # ===========================================================
-  # 🔑 NOVO: runtime injection
-  # ===========================================================
-  def setup_runtime
-    ensure_ui_alive
-
-    runtime = ApiRuntime.new(
+  def build_shell_runtime
+    ApiRuntime.new(
       browser: @browser,
       display: @display,
-      host: self
+      host: self,
+      state: @state
     )
-
-    # 🔑 apenas injeta runtime
-    @agent.instance_variable_set(:@runtime, runtime)
-
-    # 🔑 atualizar lista de métodos
-    runtime_methods = runtime.public_methods(false).map(&:to_s)
-    @agent.instance_variable_set(:@runtime_methods, runtime_methods)
   end
 
   # ===========================================================
@@ -151,13 +350,11 @@ class GUIShell < GlaucoLLM
   # UI
   # ===========================================================
   def start_ui_thread
-    if defined?(@display) && @display && !@display.isDisposed
-      @display.async_exec { @shell.dispose rescue nil }
-      sleep 0.5
-      @display.dispose rescue nil
-    end
-
     ready = false
+    startup_error = nil
+
+    release_frontend_display_if_idle!
+    shutdown_ui_thread if @ui_thread&.alive?
 
     @ui_thread = Thread.new do
       begin
@@ -165,6 +362,7 @@ class GUIShell < GlaucoLLM
         @shell   = Shell.new(@display)
         @shell.setLayout(FillLayout.new)
         @browser = Browser.new(@shell, 0)
+        install_overlay_tracking!
 
         @shell.setText("Agente de Automação")
         @shell.setSize(1024, 768)
@@ -178,14 +376,25 @@ class GUIShell < GlaucoLLM
 
         @display.dispose rescue nil
       rescue => e
+        startup_error = e
         puts "[UI ERROR] #{e.class} - #{e.message}"
+      ensure
+        ready = true
       end
     end
 
     start = Time.now
-    until ready && @browser && !@browser.isDisposed
+    until ready
       sleep 0.05
       raise "Timeout ao iniciar UI" if Time.now - start > 10
+    end
+
+    raise startup_error if startup_error
+
+    start = Time.now
+    until @browser && !@browser.isDisposed
+      sleep 0.05
+      raise "Timeout ao materializar Browser" if Time.now - start > 10
     end
   end
 
@@ -198,6 +407,29 @@ class GUIShell < GlaucoLLM
     if @display.nil? || @display.isDisposed
       start_ui_thread
     end
+  end
+
+  def shutdown_ui_thread
+    return unless @ui_thread&.alive?
+
+    begin
+      if @display && !@display.isDisposed
+        @display.sync_exec do
+          @overlay_shell.dispose if @overlay_shell && !@overlay_shell.isDisposed
+          @shell.dispose if @shell && !@shell.isDisposed
+        end
+      end
+    rescue StandardError
+      # Segue para o cleanup abaixo.
+    end
+
+    @ui_thread.join(2)
+
+    @display = nil
+    @shell = nil
+    @browser = nil
+    @overlay_shell = nil
+    @overlay_browser = nil
   end
 
   # ===========================================================
@@ -229,14 +461,408 @@ class GUIShell < GlaucoLLM
   def read_html
     evaluate("return document.documentElement.outerHTML;")
   end
+
+  # ===========================================================
+  # overlay page
+  # ===========================================================
+  def overlay_open?
+    !!(@overlay_shell && !@overlay_shell.isDisposed && @overlay_shell.getVisible)
+  end
+
+  def overlay_page(url: nil, html: nil, bounds: nil, alpha: 255, focus: false)
+    show_overlay_page(
+      url: url,
+      html: html,
+      bounds: bounds,
+      alpha: alpha,
+      focus: focus
+    )
+  end
+
+  def show_overlay_page(url: nil, html: nil, bounds: nil, alpha: 255, focus: false)
+    run_ui do
+      ensure_overlay_shell!
+
+      @state[:overlay][:url] = url if url
+      @state[:overlay][:alpha] = alpha
+      @state[:overlay][:bounds] = bounds if bounds
+
+      begin
+        @overlay_shell.setAlpha(alpha)
+      rescue StandardError
+        # Algumas plataformas/WM nao suportam alpha em Shell.
+      end
+
+      sync_overlay_page_bounds(bounds)
+
+      @overlay_browser.setUrl(url) if url
+      @overlay_browser.setText(html) if html
+
+      @overlay_shell.setVisible(true)
+      @overlay_shell.open
+      @overlay_shell.setActive if focus
+
+      @state[:overlay][:visible] = true
+      @state[:overlay][:requested_visible] = true
+      true
+    end
+  end
+
+  def hide_overlay_page
+    run_ui do
+      return unless @overlay_shell && !@overlay_shell.isDisposed
+
+      @overlay_shell.setVisible(false)
+      @state[:overlay][:visible] = false
+      @state[:overlay][:requested_visible] = false
+      true
+    end
+  end
+
+  def close_overlay_page
+    hide_overlay_page
+  end
+
+  def dispose_overlay_page
+    run_ui do
+      return unless @overlay_shell && !@overlay_shell.isDisposed
+
+      @overlay_browser.dispose if @overlay_browser && !@overlay_browser.isDisposed
+      @overlay_shell.dispose
+      @overlay_browser = nil
+      @overlay_shell = nil
+      @state[:overlay][:visible] = false
+      @state[:overlay][:requested_visible] = false
+      true
+    end
+  end
+
+  def sync_overlay_page_bounds(bounds = nil)
+    return unless @browser && !@browser.isDisposed
+    return unless @overlay_shell && !@overlay_shell.isDisposed
+
+    browser_bounds = @browser.getBounds
+    resolved = resolve_overlay_bounds(browser_bounds, bounds || @state.dig(:overlay, :bounds))
+    origin = @browser.toDisplay(resolved[:x], resolved[:y])
+
+    @overlay_shell.setBounds(origin.x, origin.y, resolved[:width], resolved[:height])
+    resolved
+  end
+
+  def overlay_support_report
+    <<~TXT.strip
+      SWT overlay page viavel via child Shell + Browser secundario.
+      Melhor caminho: Shell filha com SWT::NO_TRIM | SWT::ON_TOP | SWT::TOOL, sincronizada com o Browser principal.
+      Limite importante: nao e uma subview real dentro do Browser; e uma janela nativa separada posicionada sobre ele.
+      Em Linux/Wayland e em algumas engines do SWT Browser, alpha e coordenadas podem variar por window manager.
+    TXT
+  end
+
+  private
+
+  def ensure_overlay_shell!
+    return @overlay_shell if @overlay_shell && !@overlay_shell.isDisposed
+
+    overlay_style = SWT::NO_TRIM | SWT::ON_TOP | SWT::TOOL
+    @overlay_shell = Shell.new(@shell, overlay_style)
+    @overlay_shell.setLayout(FillLayout.new)
+    @overlay_browser = Browser.new(@overlay_shell, 0)
+    @overlay_shell.setVisible(false)
+
+    begin
+      @overlay_shell.setAlpha(@state.dig(:overlay, :alpha) || 255)
+    rescue StandardError
+      # Alpha nao e garantido em todas as plataformas.
+    end
+
+    sync_overlay_page_bounds
+    @overlay_shell
+  end
+
+  def install_overlay_tracking!
+    listener = Listener.impl { |_event| sync_overlay_page_bounds if overlay_open? rescue nil }
+    deactivate_listener = Listener.impl { |_event| hide_overlay_for_parent_state! rescue nil }
+    activate_listener = Listener.impl { |_event| restore_overlay_for_parent_state! rescue nil }
+    close_listener = Listener.impl { |_event| dispose_overlay_page rescue nil }
+
+    @shell.addListener(SWT::Move, listener)
+    @shell.addListener(SWT::Resize, listener)
+    @shell.addListener(SWT::Deactivate, deactivate_listener)
+    @shell.addListener(SWT::Iconify, deactivate_listener)
+    @shell.addListener(SWT::Activate, activate_listener)
+    @shell.addListener(SWT::Deiconify, activate_listener)
+    @shell.addListener(SWT::Close, close_listener)
+  end
+
+  def resolve_overlay_bounds(browser_bounds, requested_bounds)
+    bounds = requested_bounds || {}
+
+    x =
+      if bounds.key?(:x)
+        bounds[:x].to_i
+      else
+        (browser_bounds.width * (bounds.fetch(:x_ratio, 0.0))).to_i
+      end
+
+    y =
+      if bounds.key?(:y)
+        bounds[:y].to_i
+      else
+        (browser_bounds.height * (bounds.fetch(:y_ratio, 0.15))).to_i
+      end
+
+    width =
+      if bounds.key?(:width)
+        bounds[:width].to_i
+      else
+        (browser_bounds.width * (bounds.fetch(:width_ratio, 1.0))).to_i
+      end
+
+    height =
+      if bounds.key?(:height)
+        bounds[:height].to_i
+      else
+        (browser_bounds.height * (bounds.fetch(:height_ratio, 0.70))).to_i
+      end
+
+    {
+      x: x,
+      y: y,
+      width: [width, 1].max,
+      height: [height, 1].max
+    }
+  end
+
+  def hide_overlay_for_parent_state!
+    return unless @overlay_shell && !@overlay_shell.isDisposed
+    return unless @state.dig(:overlay, :requested_visible)
+
+    @overlay_shell.setVisible(false)
+    @state[:overlay][:visible] = false
+  end
+
+  def restore_overlay_for_parent_state!
+    return unless @overlay_shell && !@overlay_shell.isDisposed
+    return unless @state.dig(:overlay, :requested_visible)
+
+    sync_overlay_page_bounds
+    @overlay_shell.setVisible(true)
+    @state[:overlay][:visible] = true
+  end
+
+  def release_frontend_display_if_idle!
+    return unless defined?($display) && $display && !$display.isDisposed
+
+    shell_visible =
+      begin
+        defined?($shell) && $shell && !$shell.isDisposed && $shell.getVisible
+      rescue StandardError
+        false
+      end
+
+    return if shell_visible
+
+    begin
+      $browser.dispose if defined?($browser) && $browser && !$browser.isDisposed
+      $shell.dispose if defined?($shell) && $shell && !$shell.isDisposed
+      $display.dispose unless $display.isDisposed
+    rescue StandardError
+      # Se o frontend global nao puder ser reciclado, o startup do shell dedicado
+      # ainda vai falhar explicitamente ao tentar abrir outro Display.
+    ensure
+      if defined?($embedded_surfaces) && $embedded_surfaces
+        $embedded_surfaces.each_value do |surface|
+          surface.dispose if surface && !surface.isDisposed rescue nil
+        end
+      end
+      $embedded_surfaces = {}
+      $browser = nil
+      $surface_parent = nil
+      $shell = nil
+      $display = nil
+      $root = nil
+    end
+  end
 end
 
 module Frontend
   DEBUG = true
   DEFAULT_PORT = (ENV["GLAUCO_PORT"] || "8000").to_i
+  @overlay_registry = {}
+  @embedded_browser_registry = {}
 
   def debug_log(msg)
     puts "[DEBUG] #{msg}" if DEBUG
+  end
+
+  def self.overlay_registry
+    @overlay_registry ||= {}
+  end
+
+  def self.embedded_browser_registry
+    @embedded_browser_registry ||= {}
+  end
+
+  def self.register_overlay_page(id, config)
+    overlay_registry[id.to_s] = config
+  end
+
+  def self.register_embedded_browser(id, config)
+    embedded_browser_registry[id.to_s] = config
+  end
+
+  def self.register_overlay_geometry_callback(browser, element_id)
+    callback_name = "overlay_geom_#{element_id}_#{rand(1000..9999)}"
+
+    $callbacks[callback_name] = proc do |payload|
+      begin
+        data = payload.is_a?(String) ? JSON.parse(payload) : payload
+        update_overlay_geometry(data)
+      rescue => e
+        puts "[Overlay] geometry callback error: #{e.class} - #{e.message}"
+      end
+    end
+
+    browserFunctionFac(browser, callback_name)
+    callback_name
+  end
+
+  def self.register_embedded_browser_geometry_callback(browser, element_id)
+    callback_name = "embedded_geom_#{element_id}_#{rand(1000..9999)}"
+
+    $callbacks[callback_name] = proc do |payload|
+      begin
+        data = payload.is_a?(String) ? JSON.parse(payload) : payload
+        update_embedded_browser_geometry(data)
+      rescue => e
+        puts "[EmbeddedBrowser] geometry callback error: #{e.class} - #{e.message}"
+      end
+    end
+
+    browserFunctionFac(browser, callback_name)
+    callback_name
+  end
+
+  def self.update_overlay_geometry(data)
+    element_id = data["id"].to_s
+    config = overlay_registry[element_id]
+    return unless config
+
+    config[:visual_bounds] = {
+      x: data["x"].to_i,
+      y: data["y"].to_i,
+      width: data["width"].to_i,
+      height: data["height"].to_i
+    }
+
+    if $overlay_state && $overlay_state[:element_id] == element_id && $overlay_state[:requested_visible]
+      sync_overlay_page_bounds(config[:visual_bounds])
+    end
+  end
+
+  def self.update_embedded_browser_geometry(data)
+    element_id = data["id"].to_s
+    config = embedded_browser_registry[element_id]
+    return unless config
+
+    config[:visual_bounds] = {
+      x: data["x"].to_i,
+      y: data["y"].to_i,
+      width: data["width"].to_i,
+      height: data["height"].to_i
+    }
+
+    sync_embedded_browser_surface(element_id)
+  end
+
+  def self.overlay_bridge_script
+    <<~HTML
+      <script>
+        (() => {
+          const previous = new Map();
+
+          const collect = () => {
+            document.querySelectorAll('[data-overlay-host="true"]').forEach((node) => {
+              const callbackName = node.getAttribute('data-overlay-geometry-callback');
+              if (!callbackName || typeof window[callbackName] !== 'function') return;
+
+              const rect = node.getBoundingClientRect();
+              const payload = {
+                id: node.id,
+                x: Math.round(rect.left),
+                y: Math.round(rect.top),
+                width: Math.round(rect.width),
+                height: Math.round(rect.height)
+              };
+
+              const key = JSON.stringify(payload);
+              if (previous.get(node.id) === key) return;
+
+              previous.set(node.id, key);
+              window[callbackName](key);
+            });
+          };
+
+          window.addEventListener('load', collect);
+          window.addEventListener('resize', collect);
+          window.addEventListener('scroll', collect, true);
+
+          if (typeof ResizeObserver !== 'undefined') {
+            const observer = new ResizeObserver(() => collect());
+            window.addEventListener('load', () => {
+              document.querySelectorAll('[data-overlay-host="true"]').forEach((node) => observer.observe(node));
+            });
+          }
+
+          setInterval(collect, 250);
+        })();
+      </script>
+    HTML
+  end
+
+  def self.embedded_browser_bridge_script
+    <<~HTML
+      <script>
+        (() => {
+          const previous = new Map();
+
+          const collect = () => {
+            document.querySelectorAll('[data-embedded-browser-host="true"]').forEach((node) => {
+              const callbackName = node.getAttribute('data-embedded-browser-geometry-callback');
+              if (!callbackName || typeof window[callbackName] !== 'function') return;
+
+              const rect = node.getBoundingClientRect();
+              const payload = {
+                id: node.id,
+                x: Math.round(rect.left),
+                y: Math.round(rect.top),
+                width: Math.round(rect.width),
+                height: Math.round(rect.height)
+              };
+
+              const key = JSON.stringify(payload);
+              if (previous.get(node.id) === key) return;
+
+              previous.set(node.id, key);
+              window[callbackName](key);
+            });
+          };
+
+          window.addEventListener('load', collect);
+          window.addEventListener('resize', collect);
+          window.addEventListener('scroll', collect, true);
+
+          if (typeof ResizeObserver !== 'undefined') {
+            const observer = new ResizeObserver(() => collect());
+            window.addEventListener('load', () => {
+              document.querySelectorAll('[data-embedded-browser-host="true"]').forEach((node) => observer.observe(node));
+            });
+          }
+
+          setInterval(collect, 250);
+        })();
+      </script>
+    HTML
   end
 
   require 'java'
@@ -311,6 +937,258 @@ module Frontend
     end
   end
 
+  def self.ensure_overlay_shell!
+    return $overlay_shell if defined?($overlay_shell) && $overlay_shell && !$overlay_shell.isDisposed
+
+    overlay_style = SWT::NO_TRIM | SWT::ON_TOP | SWT::TOOL
+    $overlay_shell = Shell.new($shell, overlay_style)
+    $overlay_shell.setLayout(FillLayout.new)
+    $overlay_browser = Browser.new($overlay_shell, 0)
+    $overlay_shell.setVisible(false)
+
+    begin
+      $overlay_shell.setAlpha(255)
+    rescue StandardError
+      # Alpha depende do window manager.
+    end
+
+    install_overlay_tracking!
+    $overlay_shell
+  end
+
+  def self.install_overlay_tracking!
+    return if defined?($overlay_tracking_installed) && $overlay_tracking_installed
+
+    listener = Listener.impl { |_event| sync_overlay_page_bounds if overlay_open? rescue nil }
+    deactivate_listener = Listener.impl { |_event| hide_overlay_for_parent_state! rescue nil }
+    activate_listener = Listener.impl { |_event| restore_overlay_for_parent_state! rescue nil }
+    close_listener = Listener.impl { |_event| dispose_overlay_page rescue nil }
+
+    $shell.addListener(SWT::Move, listener)
+    $shell.addListener(SWT::Resize, listener)
+    $shell.addListener(SWT::Deactivate, deactivate_listener)
+    $shell.addListener(SWT::Iconify, deactivate_listener)
+    $shell.addListener(SWT::Activate, activate_listener)
+    $shell.addListener(SWT::Deiconify, activate_listener)
+    $shell.addListener(SWT::Close, close_listener)
+
+    $overlay_tracking_installed = true
+  end
+
+  def self.overlay_open?
+    !!(defined?($overlay_shell) && $overlay_shell && !$overlay_shell.isDisposed && $overlay_shell.getVisible)
+  end
+
+  def self.show_overlay_page(url: nil, html: nil, bounds: nil, alpha: 255, focus: false)
+    ensure_overlay_shell!
+
+    puts "[Overlay] show_overlay_page url=#{url.inspect} html?=#{!html.nil?} bounds=#{bounds.inspect} alpha=#{alpha}"
+
+    begin
+      $overlay_shell.setAlpha(alpha)
+    rescue StandardError
+      # Alpha depende do window manager.
+    end
+
+    $overlay_state = {
+      url: url,
+      html: html,
+      alpha: alpha,
+      bounds: bounds,
+      requested_visible: true
+    }
+
+    sync_overlay_page_bounds(bounds)
+    $overlay_browser.setText(html) if html
+    $overlay_browser.setUrl(url) if url && html.nil?
+    $overlay_shell.setVisible(true)
+    $overlay_shell.open
+    $overlay_shell.setActive if focus
+    true
+  end
+
+  def self.hide_overlay_page
+    return unless defined?($overlay_shell) && $overlay_shell && !$overlay_shell.isDisposed
+
+    $overlay_shell.setVisible(false)
+    $overlay_state[:requested_visible] = false if $overlay_state
+    true
+  end
+
+  def self.close_overlay_page
+    hide_overlay_page
+  end
+
+  def self.dispose_overlay_page
+    return unless defined?($overlay_shell) && $overlay_shell && !$overlay_shell.isDisposed
+
+    $overlay_browser.dispose if defined?($overlay_browser) && $overlay_browser && !$overlay_browser.isDisposed
+    $overlay_shell.dispose
+    $overlay_browser = nil
+    $overlay_shell = nil
+    $overlay_state = nil
+    true
+  end
+
+  def self.sync_overlay_page_bounds(bounds = nil)
+    return unless defined?($browser) && $browser && !$browser.isDisposed
+    return unless defined?($overlay_shell) && $overlay_shell && !$overlay_shell.isDisposed
+
+    browser_bounds = $browser.getBounds
+    resolved = resolve_overlay_bounds(browser_bounds, bounds || ($overlay_state && $overlay_state[:bounds]))
+    origin = $browser.toDisplay(resolved[:x], resolved[:y])
+    $overlay_shell.setBounds(origin.x, origin.y, resolved[:width], resolved[:height])
+    resolved
+  end
+
+  def self.resolve_overlay_bounds(browser_bounds, requested_bounds)
+    bounds = requested_bounds || {}
+
+    x = bounds.key?(:x) ? bounds[:x].to_i : (browser_bounds.width * bounds.fetch(:x_ratio, 0.0)).to_i
+    y = bounds.key?(:y) ? bounds[:y].to_i : (browser_bounds.height * bounds.fetch(:y_ratio, 0.15)).to_i
+    width = bounds.key?(:width) ? bounds[:width].to_i : (browser_bounds.width * bounds.fetch(:width_ratio, 1.0)).to_i
+    height = bounds.key?(:height) ? bounds[:height].to_i : (browser_bounds.height * bounds.fetch(:height_ratio, 0.70)).to_i
+
+    {
+      x: x,
+      y: y,
+      width: [width, 1].max,
+      height: [height, 1].max
+    }
+  end
+
+  def self.hide_overlay_for_parent_state!
+    return unless defined?($overlay_shell) && $overlay_shell && !$overlay_shell.isDisposed
+    return unless $overlay_state && $overlay_state[:requested_visible]
+
+    $overlay_shell.setVisible(false)
+  end
+
+  def self.restore_overlay_for_parent_state!
+    return unless defined?($overlay_shell) && $overlay_shell && !$overlay_shell.isDisposed
+    return unless $overlay_state && $overlay_state[:requested_visible]
+
+    sync_overlay_page_bounds
+    $overlay_shell.setVisible(true)
+  end
+
+  def self.open_overlay_page_for_element(element_id)
+    config = overlay_registry[element_id.to_s]
+    raise "overlay element not found: #{element_id}" unless config
+
+    bounds = (config[:visual_bounds] || config[:bounds] || {}).dup
+
+    show_overlay_page(
+      url: config[:url],
+      html: config[:html],
+      alpha: (config[:alpha] || 255).to_i,
+      bounds: bounds
+    )
+
+    $overlay_state[:element_id] = element_id.to_s if $overlay_state
+
+    true
+  end
+
+  def self.ensure_embedded_browser_surface!(element_id)
+    config = embedded_browser_registry[element_id.to_s]
+    raise "embedded browser element not found: #{element_id}" unless config
+    raise "surface parent composite não inicializado" unless defined?($surface_parent) && $surface_parent && !$surface_parent.isDisposed
+
+    $embedded_surfaces ||= {}
+    surface = $embedded_surfaces[element_id.to_s]
+    return surface if surface && !surface.isDisposed
+
+    surface = Browser.new($surface_parent, 0)
+    surface.setVisible(false)
+    surface.moveAbove(nil)
+    $embedded_surfaces[element_id.to_s] = surface
+    surface
+  end
+
+  def self.show_embedded_browser(element_id)
+    config = embedded_browser_registry[element_id.to_s]
+    return unless config
+
+    surface = ensure_embedded_browser_surface!(element_id)
+    bounds = config[:visual_bounds] || config[:bounds] || {}
+    sync_embedded_browser_surface(element_id, bounds)
+
+    if config[:html]
+      surface.setText(config[:html])
+    elsif config[:url]
+      surface.setUrl(config[:url])
+    end
+
+    surface.setVisible(config.fetch(:visible, true))
+    surface.moveAbove(nil)
+    true
+  end
+
+  def self.hide_embedded_browser(element_id)
+    return unless defined?($embedded_surfaces) && $embedded_surfaces
+
+    surface = $embedded_surfaces[element_id.to_s]
+    return unless surface && !surface.isDisposed
+
+    surface.setVisible(false)
+    true
+  end
+
+  def self.dispose_embedded_browser(element_id)
+    return unless defined?($embedded_surfaces) && $embedded_surfaces
+
+    surface = $embedded_surfaces.delete(element_id.to_s)
+    return unless surface && !surface.isDisposed
+
+    surface.dispose
+    true
+  end
+
+  def self.sync_embedded_browser_surface(element_id, fallback_bounds = nil)
+    config = embedded_browser_registry[element_id.to_s]
+    return unless config
+
+    if config.fetch(:visible, true)
+      surface = ensure_embedded_browser_surface!(element_id)
+      host_bounds = config[:visual_bounds] || fallback_bounds || config[:bounds]
+      return unless host_bounds
+
+      resolved = resolve_embedded_browser_bounds(host_bounds)
+      surface.setBounds(resolved[:x], resolved[:y], resolved[:width], resolved[:height])
+      surface.setVisible(true)
+      surface.moveAbove(nil)
+    else
+      hide_embedded_browser(element_id)
+    end
+
+    true
+  end
+
+  def self.sync_embedded_browser_surfaces
+    embedded_browser_registry.keys.each do |element_id|
+      sync_embedded_browser_surface(element_id)
+    end
+  end
+
+  def self.resolve_embedded_browser_bounds(bounds)
+    {
+      x: bounds[:x].to_i,
+      y: bounds[:y].to_i,
+      width: [bounds[:width].to_i, 1].max,
+      height: [bounds[:height].to_i, 1].max
+    }
+  end
+
+  def self.sync_frontend_layout!
+    return unless defined?($surface_parent) && $surface_parent && !$surface_parent.isDisposed
+    return unless defined?($browser) && $browser && !$browser.isDisposed
+
+    area = $surface_parent.getClientArea
+    $browser.setBounds(0, 0, area.width, area.height)
+    sync_embedded_browser_surfaces
+  end
+
   # ===========================================================
   # 🔥 Carbon Registry
   # ===========================================================
@@ -329,7 +1207,7 @@ module CarbonRegistry
 
   HTML_TAGS = Set.new(%w[
     html head body title meta link style script
-    div span p a
+    div span p a strong button
     form label fieldset legend
     ul ol li
     main section article aside footer
@@ -337,6 +1215,8 @@ module CarbonRegistry
     h1 h2 h3 h4 h5 h6
     br hr
     svg path
+    overlay-page
+    embedded-browser
   ])
 
   @available_tags = Set.new
@@ -472,7 +1352,7 @@ end
   # ===========================================================
   $callbacks = {}
 
-  def browserFunctionFac(callback_name)
+  def self.browserFunctionFac(browser, callback_name)
     Class.new(Java::OrgEclipseSwtBrowser::BrowserFunction) do
       define_method(:function) do |*args|
         begin
@@ -483,7 +1363,7 @@ end
           puts "Error in callback #{callback_name}: #{e.class} - #{e.message}"
         end
       end
-    end.new($browser, callback_name)
+    end.new(browser, callback_name)
   end
 
   # ===========================================================
@@ -499,7 +1379,7 @@ end
     def bind_callback(event, proc_obj)
       callback_name = "callback_#{rand(1000..9999)}"
       $callbacks[callback_name] = proc_obj
-      browserFunctionFac(callback_name)
+      Frontend.browserFunctionFac(@browser, callback_name)
 
       attr = event.to_s.gsub('_', '')
 
@@ -524,6 +1404,8 @@ end
             #{CarbonRegistry.style_tag}
             #{CarbonRegistry.script_tag}
             #{CarbonRegistry.defined_style_tag}
+            #{Frontend.overlay_bridge_script}
+            #{Frontend.embedded_browser_bridge_script}
             <style>
               html, body {
                 margin: 0;
@@ -845,13 +1727,7 @@ end
 
       inner_content =
         if block
-          result = instance_eval(&block)
-          components = result.is_a?(Array) ? result : [result]
-
-          components.map do |c|
-            add_child(c) if c.is_a?(Component)
-            c.is_a?(Component) ? c.render_to_html : c.to_s
-          end.join
+          render_nodes(instance_eval(&block))
         else
           content_or_attrs.is_a?(Component) ? content_or_attrs.render_to_html : content_or_attrs.to_s
         end
@@ -879,6 +1755,120 @@ end
 
     def p(*args, **attrs, &block)
       tag(:p, *args, **attrs, &block)
+    end
+
+    def overlay_page_element(id:, url: nil, html: nil, alpha: 255, x: nil, y: nil, width: nil, height: nil,
+                             x_ratio: nil, y_ratio: nil, width_ratio: nil, height_ratio: nil, **attrs, &block)
+      geometry_callback = Frontend.register_overlay_geometry_callback(@parent_renderer.browser, id)
+
+      Frontend.register_overlay_page(
+        id,
+        {
+          url: url,
+          html: html,
+          alpha: alpha,
+          bounds: {
+            x: x,
+            y: y,
+            width: width,
+            height: height,
+            x_ratio: x_ratio,
+            y_ratio: y_ratio,
+            width_ratio: width_ratio,
+            height_ratio: height_ratio
+          }.compact
+        }
+      )
+
+      overlay_attrs = attrs.merge(
+        id: id,
+        data_overlay_host: "true",
+        data_overlay_geometry_callback: geometry_callback,
+        data_overlay_url: url,
+        data_overlay_html: html,
+        data_overlay_alpha: alpha,
+        data_overlay_x: x,
+        data_overlay_y: y,
+        data_overlay_width: width,
+        data_overlay_height: height,
+        data_overlay_x_ratio: x_ratio,
+        data_overlay_y_ratio: y_ratio,
+        data_overlay_width_ratio: width_ratio,
+        data_overlay_height_ratio: height_ratio
+      )
+
+      tag("overlay-page", **overlay_attrs, &block)
+    end
+
+    def embedded_browser_element(id:, url: nil, html: nil, visible: true, x: nil, y: nil, width: nil, height: nil, **attrs, &block)
+      geometry_callback = Frontend.register_embedded_browser_geometry_callback(@parent_renderer.browser, id)
+      host_content = attrs.delete(:host_content) || ""
+      embedded_html =
+        if block
+          build_embedded_browser_document(render_nodes(instance_eval(&block)))
+        elsif html
+          warn "[embedded_browser_element] html: está deprecado; prefira conteúdo via bloco de tags."
+          html
+        else
+          nil
+        end
+
+      Frontend.register_embedded_browser(
+        id,
+        {
+          url: url,
+          html: embedded_html,
+          visible: visible,
+          bounds: {
+            x: x,
+            y: y,
+            width: width,
+            height: height
+          }.compact
+        }
+      )
+
+      embedded_attrs = attrs.merge(
+        id: id,
+        data_embedded_browser_host: "true",
+        data_embedded_browser_geometry_callback: geometry_callback,
+        data_embedded_browser_url: url,
+        data_embedded_browser_html: embedded_html,
+        data_embedded_browser_visible: visible
+      )
+
+      tag("embedded-browser", host_content, **embedded_attrs)
+    end
+
+    def render_nodes(result)
+      components = result.is_a?(Array) ? result : [result]
+
+      components.map do |c|
+        add_child(c) if c.is_a?(Component)
+        c.is_a?(Component) ? c.render_to_html : c.to_s
+      end.join
+    end
+
+    def build_embedded_browser_document(inner_html)
+      <<~HTML
+        <!DOCTYPE html>
+        <html>
+          <head>
+            <meta charset="UTF-8">
+            <style>
+              html, body {
+                margin: 0;
+                padding: 0;
+                width: 100%;
+                height: 100%;
+              }
+            </style>
+          </head>
+          <body>
+            #{inner_html}
+          </body>
+        </html>
+      HTML
     end
 
     def render_to_html
@@ -923,21 +1913,29 @@ end
   $display = Display.new
   $shell   = Shell.new($display)
   $shell.setLayout(FillLayout.new)
+  $surface_parent = Composite.new($shell, 0)
+  $surface_parent.setLayout(nil)
+  $embedded_surfaces = {}
 
-  $browser = Browser.new($shell, 0)
+  $browser = Browser.new($surface_parent, 0)
   $root    = RootRenderer.new($browser)
+
+  frontend_resize_listener = Listener.impl { |_event| Frontend.sync_frontend_layout! rescue nil }
+  $shell.addListener(SWT::Resize, frontend_resize_listener)
+  $surface_parent.addListener(SWT::Resize, frontend_resize_listener)
   
   Thread.new { server.start }
 
   def self.start!
     $shell.open
+    sync_frontend_layout!
     $display.async_exec do
       $browser.setUrl("#{base_url}/index.html")
     end
-    run_loop
+    self.run_loop
   end
   
-  def run_loop
+  def self.run_loop
 		while !$shell.disposed?
 			$display.sleep unless $display.read_and_dispatch
 		end

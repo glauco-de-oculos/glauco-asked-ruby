@@ -100,6 +100,9 @@ module RagIndex
 end
 
 module RLM
+  raw_ollama_host = ENV.fetch("OLLAMA_HOST", "http://127.0.0.1:11434").sub(%r{/*$}, "")
+  DEFAULT_OPENAI_COMPAT_ENDPOINT = raw_ollama_host.sub(%r{/v1$}, "") + "/v1"
+  DEFAULT_MODEL_NAME = ENV.fetch("OLLAMA_MODEL", "gemma4:e2b")
 
   # ---------------------------
   # AGENT
@@ -136,8 +139,8 @@ module RLM
     SYS
 
     def initialize(
-      model: "local-gguf",
-      endpoint: "http://127.0.0.1:8080/v1",
+      model: DEFAULT_MODEL_NAME,
+      endpoint: DEFAULT_OPENAI_COMPAT_ENDPOINT,
       initial_vars: {},
       runtime: nil
     )
@@ -366,9 +369,11 @@ module RLM
     )
 
     class Runner
+      DEFAULT_TEST_MODEL = ENV.fetch("OLLAMA_MODEL", RLM::DEFAULT_MODEL_NAME)
+
       attr_reader :cases, :results
 
-      def initialize(agent:, model: "local-gguf", cases: [])
+      def initialize(agent:, model: DEFAULT_TEST_MODEL, cases: [])
         @agent = agent
         @endpoint = agent.endpoint
         @model = model
@@ -491,8 +496,8 @@ end
 
 class GlaucoLLM
 
-  DEFAULT_ENDPOINT = "http://127.0.0.1:8080/v1"
-  DEFAULT_MODEL    = "local-gguf"
+  DEFAULT_ENDPOINT = RLM::DEFAULT_OPENAI_COMPAT_ENDPOINT
+  DEFAULT_MODEL    = RLM::DEFAULT_MODEL_NAME
 
   def initialize(
     endpoint: DEFAULT_ENDPOINT,
@@ -508,53 +513,31 @@ class GlaucoLLM
     @domain_specific_knowledge = nil
   end
 
-  # ===========================================================
-  # 🧠 setup_llm (mantido)
-  # ===========================================================
-  def setup_llm(system_config_instructions:, domain_specific_knowledge: nil)
-    puts "[LLM] 🚀 setup_llm (vars-only mode)"
+  def build_agent(initial_vars: {}, runtime: nil)
+    normalized_vars = initial_vars.transform_keys(&:to_s)
 
-    @config_path = File.expand_path(system_config_instructions)
-    @domain_specific_knowledge = domain_specific_knowledge
-
-    initial_vars = {}
-
-    # ---------------------------
-    # system_config → VAR
-    # ---------------------------
-    if File.exist?(@config_path)
-      system_config = File.read(@config_path, encoding: "UTF-8")
-      initial_vars["system_config"] = system_config
-    else
-      raise "system_config_instructions não encontrado: #{@config_path}"
-    end
-
-    # ---------------------------
-    # domain_knowledge → VAR
-    # ---------------------------
-    if @domain_specific_knowledge && File.exist?(@domain_specific_knowledge)
-      knowledge = File.read(@domain_specific_knowledge, encoding: "UTF-8")
-      initial_vars["domain_knowledge"] = knowledge
-    end
-
-    # ---------------------------
-    # criar agent
-    # ---------------------------
     @agent = RLM::Agent.new(
       model: @model,
       endpoint: @endpoint,
-      initial_vars: initial_vars
+      initial_vars: normalized_vars,
+      runtime: runtime
     )
+  end
 
-    puts "[LLM] ✅ Agent pronto (vars: system_config, domain_knowledge)"
-    @agent
+  def attach_runtime(runtime)
+    raise "Agent não inicializado. Chame build_agent primeiro." unless @agent
+
+    runtime_methods = runtime.public_methods(false).map(&:to_s)
+    @agent.instance_variable_set(:@runtime, runtime)
+    @agent.instance_variable_set(:@runtime_methods, runtime_methods)
+    runtime
   end
 
   # ===========================================================
   # execução
   # ===========================================================
   def interpretar(input_text)
-    raise "LLM não inicializado. Chame setup_llm primeiro." unless @agent
+    raise "LLM não inicializado. Chame build_agent primeiro." unless @agent
 
     @agent.run(input_text)
   end

@@ -43,14 +43,15 @@ class FloatingChatAgent < GlaucoLLM
   def initialize
     super()
 
-    setup_llm(system_config_instructions: SYSTEM_CONFIG_PATH)
-    setup_runtime
+    runtime = build_chat_runtime
+    bootstrap_agent!(
+      system_config_instructions: SYSTEM_CONFIG_PATH,
+      runtime: runtime
+    )
   end
 
-  def setup_runtime
-    runtime = FloatingChatRuntime.new
-    @agent.instance_variable_set(:@runtime, runtime)
-    @agent.instance_variable_set(:@runtime_methods, runtime.public_methods(false).map(&:to_s))
+  def build_chat_runtime
+    FloatingChatRuntime.new
   end
 end
 
