@@ -481,6 +481,7 @@ class GlaucoBasicPlasticAgent
     ensure_lms_installed!
     ensure_llama_server_binary!
     ensure_llama_server_model_downloaded!
+    restart_llama_server! if llama_server_running? && !llama_server_matches_target?
     ensure_llama_server_http!
     wait_for_llama_server_models!
 
@@ -501,19 +502,15 @@ class GlaucoBasicPlasticAgent
   end
 
   def ensure_llama_server_model_downloaded!
+    sync_framework_model_from_download! if framework_model_outdated?
     return if resolved_llama_server_model_path
 
     model_key = presence(@llama_server_model_key)
     raise "Defina GLAUCO_LLAMASERVER_MODEL_KEY para baixar um modelo GGUF via LM Studio." unless model_key
 
     download_llama_server_model!(model_key)
-    source_model_path = locate_downloaded_llama_server_model_path
-    raise "O modelo #{model_key} não foi localizado depois do download via LM Studio." unless source_model_path
-
-    FileUtils.mkdir_p(File.dirname(@llama_server_model_path))
-    FileUtils.cp(source_model_path, @llama_server_model_path)
-
-    return if @llama_server_model_path
+    sync_framework_model_from_download!
+    return if resolved_llama_server_model_path
 
     raise "O modelo #{model_key} não foi localizado depois do download via LM Studio."
   end
@@ -570,6 +567,32 @@ class GlaucoBasicPlasticAgent
     false
   end
 
+  def llama_server_matches_target?
+    uri = URI("#{DEFAULT_LLAMA_SERVER_ENDPOINT}/models")
+    response = Net::HTTP.get_response(uri)
+    return false unless response.is_a?(Net::HTTPSuccess)
+
+    payload = JSON.parse(response.body)
+    models = Array(payload["data"]) + Array(payload["models"])
+    identifiers = models.flat_map do |entry|
+      [entry["id"], entry["model"], entry["name"], *Array(entry["aliases"])].compact
+    end
+
+    identifiers.map!(&:to_s)
+    identifiers.include?(@llama_server_identifier.to_s)
+  rescue StandardError
+    false
+  end
+
+  def restart_llama_server!
+    system("pkill", "-f", "#{LLAMA_SERVER_BIN} --model")
+    wait_until!("llama-server antigo não encerrou.", timeout: 10) do
+      !llama_server_running?
+    end
+  rescue StandardError
+    nil
+  end
+
   def resolved_llama_server_model_path
     return @llama_server_model_path if @llama_server_model_path && File.exist?(@llama_server_model_path)
 
@@ -577,8 +600,6 @@ class GlaucoBasicPlasticAgent
   end
 
   def locate_downloaded_llama_server_model_path
-    return @llama_server_model_path if @llama_server_model_path && File.exist?(@llama_server_model_path)
-
     models_root = discover_lmstudio_models_root
     return nil unless models_root && Dir.exist?(models_root)
 
@@ -671,6 +692,23 @@ class GlaucoBasicPlasticAgent
     presence(settings["downloadedModelsPath"]) || presence(settings["modelsPath"])
   rescue JSON::ParserError
     nil
+  end
+
+  def framework_model_outdated?
+    return false unless @llama_server_model_path && File.exist?(@llama_server_model_path)
+
+    downloaded = locate_downloaded_llama_server_model_path
+    return false unless downloaded && File.exist?(downloaded)
+
+    File.size(@llama_server_model_path) != File.size(downloaded)
+  end
+
+  def sync_framework_model_from_download!
+    source_model_path = locate_downloaded_llama_server_model_path
+    return unless source_model_path && File.exist?(source_model_path)
+
+    FileUtils.mkdir_p(File.dirname(@llama_server_model_path))
+    FileUtils.cp(source_model_path, @llama_server_model_path)
   end
 
   def llama_server_search_terms

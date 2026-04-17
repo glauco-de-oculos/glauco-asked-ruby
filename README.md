@@ -37,6 +37,10 @@ cd /home/usuario/dev/glauco-asked-ruby
 OLLAMA_HOST=http://192.168.0.10:11434 OLLAMA_MODEL=gemma4:e4b ./bin/floating-chat-ollama
 ```
 
+## Llama Server local
+
+Foi documentada uma medicao local do backend `llama-server` carregando o GGUF do proprio framework em [docs/llama-server-performance.md](/home/usuario/dev/glauco-asked-ruby/docs/llama-server-performance.md).
+
 ## Lisp/JVM direction
 
 Foi adicionado um estudo inicial para migracao da ideia da plataforma para um dialeto Lisp na JVM:
