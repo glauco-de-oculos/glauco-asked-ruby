@@ -37,7 +37,7 @@ class FloatingChatRuntime
   end
 end
 
-class FloatingChatAgent < GlaucoLLM
+class FloatingChatAgent < GlaucoBasicPlasticAgent
   SYSTEM_CONFIG_PATH = File.expand_path("floating_chat_system.md", __dir__)
 
   def initialize
@@ -388,7 +388,7 @@ class FloatingChatApp < Frontend::Component
   def ask_rlm(prompt)
     @chat_agent.interpretar(prompt).to_s
   rescue => e
-    "Nao consegui consultar o agent RLM em #{GlaucoLLM::DEFAULT_ENDPOINT}. Detalhe: #{e.message}"
+    "Nao consegui consultar o agent em #{GlaucoBasicPlasticAgent::DEFAULT_ENDPOINT}. Detalhe: #{e.message}"
   end
 
   def append_assistant_message(response)

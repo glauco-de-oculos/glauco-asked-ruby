@@ -23,7 +23,7 @@ class FloatingChatRuntime
   end
 end
 
-class FloatingChatAgent < GlaucoLLM
+class FloatingChatAgent < GlaucoBasicPlasticAgent
   SYSTEM_CONFIG_PATH = File.expand_path('../../examples/floating_chat_system.md', __dir__)
 
   def initialize

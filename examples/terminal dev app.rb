@@ -1,10 +1,8 @@
-# tests/test_suite.rb
-# Suite completa de testes para o Glauco Framework (BrowserAutoAgent + FS + Docs + OS)
-# Cada bloco imprime de forma analítica o resultado e simula cenários reais.
+# Demo interativa de terminal usando o browser embutido do Glauco Framework.
 
 require_relative '../core/framework/glauco-framework'
 
-agent = GUIShell.new
+agent = GlaucoAgentBrowserEnv.new(visible: true)
 
 def banner(title)
   puts "\n" + "=" * 80
@@ -20,28 +18,25 @@ rescue => e
   puts "[Test] 💥 Erro: #{e.class} - #{e.message}"
 end
 
-
-# ------------------------------------------------------------------------------
-# 9. TESTES INTERATIVOS (REPL)
-# ------------------------------------------------------------------------------
-banner("MODO CONSOLE INTERATIVO")
+banner('MODO CONSOLE INTERATIVO COM BROWSER')
 
 puts "Digite comandos de automação (ex: 'abrir google.com')"
+puts "O browser embutido do GlaucoAgentBrowserEnv sera aberto para navegar."
 puts "Digite 'exit' ou 'sair' para encerrar.\n\n"
 
 loop do
-  print ">> "
+  print '>> '
   input = STDIN.gets&.strip&.dup
-  break if input.nil? || input.downcase == "exit" || input.downcase == "sair"
+  break if input.nil? || input.downcase == 'exit' || input.downcase == 'sair'
 
   if input.empty?
-    puts "[Console] ⚠️ Entrada vazia ignorada."
+    puts '[Console] ⚠️ Entrada vazia ignorada.'
     next
   end
 
-  puts input.frozen?  # deve ser false antes do safe_exec
+  puts input.frozen?
   safe_exec(agent, input)
-  puts input.frozen?  # s
+  puts input.frozen?
 end
 
-puts "[Console] ✅ Sessão encerrada."
+puts '[Console] ✅ Sessão encerrada.'

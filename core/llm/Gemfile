@@ -1,6 +1,0 @@
-platforms :jruby do
-  gem "fileutils"
-  gem "open3"
-  gem "securerandom"
-  gem "ruby_llm", ">= 1.6.0"
-end

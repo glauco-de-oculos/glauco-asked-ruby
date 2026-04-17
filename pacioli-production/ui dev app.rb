@@ -9,7 +9,7 @@ class ChatApp < Component
     @state[:messages] = []
     @state[:input] = ""
 
-    @agent = GlaucoGUIShell.new
+    @agent = GlaucoAgentBrowserEnv.new
 
     define_render do
       div(style: "padding:20px; font-family:sans-serif;") do

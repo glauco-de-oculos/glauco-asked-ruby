@@ -9,6 +9,7 @@ lmstudio_node_script.js
 progress/
 app.rb
 core/models/*.*
+core/framework/models/*.gguf
 core/llamacpp/*.*
 *.jar
 runtime

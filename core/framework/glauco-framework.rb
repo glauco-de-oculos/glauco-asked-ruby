@@ -8,6 +8,14 @@ FRAMEWORK_WEB_DIR = File.join(__dir__, "web") unless defined?(FRAMEWORK_WEB_DIR)
 NODE_MODULES_DIR = File.join(FRAMEWORK_WEB_DIR, "node_modules") unless defined?(NODE_MODULES_DIR)
 
 require 'java'
+require 'fileutils'
+require 'json'
+require 'net/http'
+require 'open3'
+require 'ruby_llm'
+require 'shellwords'
+require 'timeout'
+require 'uri'
 require File.join(JARLIBS_DIR, 'swt.jar')
 
 java_import 'org.eclipse.swt.widgets.Display'
@@ -25,263 +33,805 @@ java_import 'java.awt.datatransfer.DataFlavor'
 java_import 'org.eclipse.swt.dnd.Clipboard'
 java_import 'org.eclipse.swt.dnd.TextTransfer'
 
-class WebAction
-  attr_reader :result, :done
-  
-  def initialize
-      @done = false
-      @result = nil
-      @callbacks = []
-  end
-  
-  def then(&block)
-      if @done
-      block.call(@result)
-      else
-      @callbacks << block
-      end
-      self
-  end
-  
-  def resolve(value)
-      @done = true
-      @result = value
-      @callbacks.each { |cb| cb.call(value) }
-  end
-  
-  def wait_load(timeout: 30)
-      start = Time.now
-      until @done || (Time.now - start) > timeout
-      sleep 0.05
-      end
-      @result
-  end
-end
+class GlaucoBasicPlasticAgent
+  raw_ollama_host = ENV.fetch("OLLAMA_HOST", "http://127.0.0.1:11434").sub(%r{/*$}, "")
+  DEFAULT_OPENAI_COMPAT_ENDPOINT = raw_ollama_host.sub(%r{/v1$}, "") + "/v1"
+  DEFAULT_MODEL_NAME = ENV.fetch("OLLAMA_MODEL", "gemma4:e2b")
+  DEFAULT_LLAMA_SERVER_HOST = ENV.fetch("GLAUCO_LLAMASERVER_HOST", "127.0.0.1")
+  DEFAULT_LLAMA_SERVER_PORT = ENV.fetch("GLAUCO_LLAMASERVER_PORT", "1234").to_i
+  DEFAULT_LLAMA_SERVER_ENDPOINT = ENV.fetch("GLAUCO_LLAMASERVER_ENDPOINT", "http://#{DEFAULT_LLAMA_SERVER_HOST}:#{DEFAULT_LLAMA_SERVER_PORT}/v1")
+  DEFAULT_LLAMA_SERVER_MODEL_KEY = ENV.fetch("GLAUCO_LLAMASERVER_MODEL_KEY", "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF")
+  FRAMEWORK_MODELS_DIR = File.join(__dir__, "models")
+  FRAMEWORK_LLAMA_SERVER_MODEL_PATH = ENV.fetch("GLAUCO_LLAMASERVER_LOCAL_MODEL_PATH", File.join(FRAMEWORK_MODELS_DIR, "gemma-4-e2b-it.gguf"))
+  LMS_BIN_DIR = File.join(Dir.home, ".lmstudio", "bin")
+  LLAMA_SERVER_BIN = ENV.fetch("GLAUCO_LLAMASERVER_BIN", "llama-server")
+  LLAMA_SERVER_LOG = File.join(Dir.home, ".lmstudio", "logs", "glauco-llama-server.log")
 
-require_relative '../llm/GlaucoLLM'
+  SYSTEM = <<~SYS
+    #You are an RLM agent.
 
-puts "[GlaucoWebshell] 🚀 Definindo classe GlaucoWebshell..."
+    ##STRICT RULES:
+    - ALWAYS use ```repl``` blocks
+    - NEVER answer directly outside ```repl```
+    - NEVER wrap code in `puts`, `print`, `p`, strings, or explanations
+    - NEVER output code as text that still needs to be copied and run
+    - ONLY use Ruby
+    - You MUST set variables you use
+    - You can use multiple steps, but the FINAL step must set the variable `answer`
 
-module GlaucoFramework
-  module LLMBootstrap
-    def bootstrap_agent!(system_config_instructions:, domain_specific_knowledge: nil, runtime: nil, capability_schema: nil, extra_vars: {})
-      puts "[LLM] 🚀 bootstrap_agent! (framework bootstrap)"
+    ##Execution model:
+    - You have access to:
+      1) Variables → persistent state
+      2) Runtime methods → callable functions
 
-      @config_path = File.expand_path(system_config_instructions)
-      @domain_specific_knowledge = domain_specific_knowledge && File.expand_path(domain_specific_knowledge)
+    - Call runtime methods like normal Ruby functions:
+      open_url("https://...")
 
-      initial_vars = load_bootstrap_vars(
-        config_path: @config_path,
-        knowledge_path: @domain_specific_knowledge,
-        capability_schema: capability_schema,
-        extra_vars: extra_vars
-      )
+    - Variables are already defined, do not redeclare unless needed
 
-      build_agent(initial_vars: initial_vars, runtime: runtime)
-    end
 
-    def bind_runtime_capabilities!(runtime, capability_schema: nil)
-      attach_runtime(runtime)
+    ##TERMINATION PROTOCOL (CRITICAL):
+    - When you have the final result, you MUST:
+      1) Assign it to a variable named `answer`
+      2) Output a single ```repl``` block that sets `answer`
+      3) Do NOTHING after that
+  SYS
+  # ---------------------------
+  # TEST SUITE
+  # ---------------------------
+  module TestSuite
 
-      if capability_schema
-        vars["capability_schema"] =
-          capability_schema.is_a?(String) ? capability_schema : JSON.pretty_generate(capability_schema)
-      end
+    TestCase = Struct.new(
+      :name, :input, :initial_vars, :expect, :verify_with_llm,
+      keyword_init: true
+    )
 
-      runtime
-    end
+    class Runner
+      DEFAULT_TEST_MODEL = ENV.fetch("OLLAMA_MODEL", DEFAULT_MODEL_NAME)
 
-    private
+      attr_reader :cases, :results
 
-    def load_bootstrap_vars(config_path:, knowledge_path:, capability_schema:, extra_vars:)
-      initial_vars = {}
+      def initialize(agent:, model: DEFAULT_TEST_MODEL, cases: [])
+        @agent = agent
+        @endpoint = agent.endpoint
+        @model = model
+        @cases = cases
+        @results = []
 
-      unless File.exist?(config_path)
-        raise "system_config_instructions não encontrado: #{config_path}"
+        puts "initilized"
       end
 
-      initial_vars["system_config"] = File.read(config_path, encoding: "UTF-8")
-
-      if knowledge_path && File.exist?(knowledge_path)
-        initial_vars["domain_knowledge"] = File.read(knowledge_path, encoding: "UTF-8")
+      def add(tc)
+        @cases << tc
       end
 
-      if capability_schema
-        initial_vars["capability_schema"] =
-          capability_schema.is_a?(String) ? capability_schema : JSON.pretty_generate(capability_schema)
-      end
+      def run!
+        puts "run!"
 
-      extra_vars.each do |key, value|
-        initial_vars[key.to_s] = value
-      end
+        configure_rubyllm!
 
-      initial_vars
-    end
-  end
+        @cases.each do |tc|
+          puts "\n=== #{tc.name} ==="
 
-  module ShellCapabilities
-    FRAME_LIMITATION_NOTE = "Frames internos via SWT Browser dependem da engine embutida e de same-origin. O schema abaixo prepara introspeccao e avaliacao em frame quando acessivel."
+          @agent.reset!
+          @agent.vars.delete("answer")
 
-    module_function
+          tc.initial_vars&.each do |k,v|
+            @agent.vars[k.to_s] = v
+          end
 
-    def schema
-      {
-        shell: {
-          description: "Capacidades do shell SWT para navegacao, DOM e exploracao de frames.",
-          frame_support: {
-            status: "experimental",
-            notes: FRAME_LIMITATION_NOTE,
-            fallback_paths: [
-              "Migrar a camada de shell para Julia + WebViews quando embutir frames for requisito de primeira linha.",
-              "Explorar Tauri + Leptos para manter avaliacao de JavaScript e rotas desktop com melhor controle de webview."
-            ]
-          },
-          capabilities: [
-            capability("open_url", "Abre uma URL no browser principal.", params: %w[url]),
-            capability("current_url", "Retorna a URL atual do browser principal."),
-            capability("eval_js", "Executa JavaScript no documento principal.", params: %w[js]),
-            capability("read_html", "Le o HTML renderizado da janela atual."),
-            capability("list_frames", "Inspeciona frames acessiveis da janela atual."),
-            capability("eval_js_in_frame", "Executa JavaScript em um frame acessivel por indice ou nome.", params: %w[frame_ref js]),
-            capability("frame_support_report", "Resume limites atuais de frames internos no SWT Browser.")
-          ]
-        }
-      }
-    end
+          puts "[INPUT] #{tc.input}"
 
-    def capability(name, description, params: [])
-      {
-        name: name,
-        description: description,
-        params: params
-      }
-    end
-  end
-end
+          output = @agent.run(tc.input)
 
-class GlaucoLLM
-  include GlaucoFramework::LLMBootstrap
-end
+          passed =
+            if tc.verify_with_llm
+              verify_with_llm(tc, output)
+            else
+              compare(tc.expect, output)
+            end
 
-class ApiRuntime
-  def initialize(browser:, display:, host:, state:)
-    @browser = browser
-    @display = display
-    @host = host
-    @state = state
-    @capability_schema = GlaucoFramework::ShellCapabilities.schema
-  end
+          puts "[OUTPUT] #{output}"
+          puts "[PASS?] #{passed}"
 
-  def open_url(url)
-    raise "browser nil" unless @browser
-    raise "host nil" unless @host
-
-    @host.ensure_ui_alive
-
-    @host.run_ui do
-      @state[:current_url] = url
-      @state[:last_action] = "open_url"
-      @browser.setUrl(url)
-    end
-
-    "opened #{url}"
-  end
-
-  def current_url(*)
-    @state[:current_url].to_s
-  end
-
-  def eval_js(js)
-    @state[:last_action] = "eval_js"
-    @host.ensure_ui_alive
-    @host.run_ui { @browser.evaluate(js) }
-  end
-
-  def read_html(*)
-    eval_js("return document.documentElement.outerHTML;")
-  end
-
-  def list_frames(*)
-    raw = eval_js(<<~JS)
-      return JSON.stringify((function() {
-        const frames = [];
-        for (let index = 0; index < window.frames.length; index += 1) {
-          const frame = window.frames[index];
-          try {
-            frames.push({
-              index,
-              name: frame.name || null,
-              location: frame.location ? frame.location.href : null,
-              accessible: true
-            });
-          } catch (error) {
-            frames.push({
-              index,
-              name: null,
-              location: null,
-              accessible: false,
-              error: String(error)
-            });
+          @results << {
+            name: tc.name,
+            passed: passed,
+            output: output
           }
-        }
+        end
 
-        return {
-          count: window.frames.length,
-          frames
-        };
-      })());
-    JS
+        summary
+      end
 
-    JSON.parse(raw.to_s)
+      private
+
+      # ---------------------------
+      # CONFIG GLOBAL CONTROLADO
+      # ---------------------------
+      def configure_rubyllm!
+        RubyLLM.configure do |c|
+          c.openai_api_base = @endpoint
+          c.openai_api_key  = "local"
+          c.openai_use_system_role = true
+        end
+      end
+
+      # ---------------------------
+      # COMPARAÇÃO
+      # ---------------------------
+      def compare(expect, out)
+        return expect.call(out) if expect.respond_to?(:call)
+        expect.to_s.strip == out.to_s.strip
+      end
+
+      # ---------------------------
+      # VERIFIER (STATELESS CHAT)
+      # ---------------------------
+      def verify_with_llm(tc, output)
+        configure_rubyllm!
+        chat = RubyLLM.chat(
+          model: @model,
+          provider: :openai,
+          assume_model_exists: true
+        )
+
+        res = chat.ask(<<~PROMPT)
+          You are a strict evaluator.
+
+          Task:
+          #{tc.input}
+
+          Expected:
+          #{tc.expect}
+
+          Output:
+          #{output}
+
+          Return ONLY:
+          PASS or FAIL
+        PROMPT
+
+        res.content.to_s.strip == "PASS"
+      end
+
+      # ---------------------------
+      # SUMMARY
+      # ---------------------------
+      def summary
+        total = @results.size
+        ok = @results.count { |r| r[:passed] }
+
+        puts "\nSUMMARY: #{ok}/#{total}"
+      end
+    end
+
+    def self.case(**args)
+      TestCase.new(**args)
+    end
+  end
+  attr_reader :vars, :history, :endpoint
+
+  DEFAULT_ENDPOINT = DEFAULT_OPENAI_COMPAT_ENDPOINT
+  DEFAULT_MODEL    = DEFAULT_MODEL_NAME
+
+  def initialize(
+    endpoint: DEFAULT_ENDPOINT,
+    model: DEFAULT_MODEL,
+    llm_provider: ENV.fetch("GLAUCO_LLM_PROVIDER", nil),
+    llama_server_model_key: ENV.fetch("GLAUCO_LLAMASERVER_MODEL_KEY", DEFAULT_LLAMA_SERVER_MODEL_KEY),
+    llama_server_identifier: ENV.fetch("GLAUCO_LLAMASERVER_IDENTIFIER", nil),
+    llama_server_model_path: ENV.fetch("GLAUCO_LLAMASERVER_MODEL_PATH", nil),
+    llama_server_gpu: ENV.fetch("GLAUCO_LLAMASERVER_GPU", nil),
+    llama_server_context_length: ENV.fetch("GLAUCO_LLAMASERVER_CONTEXT_LENGTH", nil),
+    llama_server_ttl: ENV.fetch("GLAUCO_LLAMASERVER_TTL", nil)
+  )
+    puts "[Glauco] 🚀 Inicializando Glauco Framework (RLM core)..."
+
+    @model = model
+    @endpoint = endpoint
+    @llm_provider = normalize_llm_provider(llm_provider, endpoint)
+    @llama_server_model_key = presence(llama_server_model_key) || DEFAULT_LLAMA_SERVER_MODEL_KEY
+    @llama_server_identifier = presence(llama_server_identifier) || @llama_server_model_key
+    @llama_server_model_path = presence(llama_server_model_path) || FRAMEWORK_LLAMA_SERVER_MODEL_PATH
+    @llama_server_gpu = presence(llama_server_gpu)
+    @llama_server_context_length = integer_or_nil(llama_server_context_length)
+    @llama_server_ttl = integer_or_nil(llama_server_ttl)
+    @initial_vars = {}
+    @vars = {}
+    @history = []
+    @runtime = nil
+    @runtime_methods = []
+    @last_code = nil
+    @config_path = nil
+    @domain_specific_knowledge = nil
+
+    initialize_llm_backend!
+  end
+
+  def build_agent(initial_vars: {}, runtime: nil)
+    reconfigure_agent!(
+      initial_vars: initial_vars,
+      runtime: runtime
+    )
+  end
+
+  def attach_runtime(runtime)
+    @runtime =
+      if runtime.is_a?(Module)
+        Object.new.extend(runtime)
+      else
+        runtime
+      end
+
+    @runtime_methods =
+      if @runtime
+        @runtime.public_methods(false).map(&:to_s)
+      else
+        []
+      end
+
+    runtime
+  end
+
+  # ===========================================================
+  # execução
+  # ===========================================================
+  def interpretar(input_text)
+    raise "LLM não inicializado. Chame build_agent primeiro." if @runtime.nil? && @initial_vars.empty?
+
+    run(input_text)
+  end
+
+  def run(input, max_iter: 8)
+    vars.delete("answer")
+    @last_code = nil
+
+    max_iter.times do
+      if vars.key?("answer")
+        puts "[AGENT] 🛑 answer already exists, stopping loop"
+        return vars["answer"]
+      end
+      puts "[AGENT] step..."
+
+      chat = build_chat
+      res = chat.ask(build_prompt(input))
+
+      text = clean_utf8(res.content)
+      puts "\n[LLM]\n#{text}"
+
+      codes = extract_repl(text)
+      puts "[NO REPL FOUND]" if codes.empty?
+
+      codes.each do |code|
+        puts "\n[REPL]\n#{code}"
+
+        if code == @last_code
+          puts "[AGENT] ⚠️ repeated code, stopping"
+          return vars["answer"] if vars.key?("answer")
+          return "Repeated code without final answer"
+        end
+
+        @last_code = code
+
+        out, _ = execute(code)
+        out = clean_utf8(out)
+
+        puts "[RESULT] #{out}"
+
+        if vars.key?("answer")
+          puts "[AGENT] ✅ final answer detected, stopping"
+          return vars["answer"]
+        end
+      end
+
+      history << msg(:assistant, text)
+    end
+
+    "No final answer"
+  end
+
+  def build_chat
+    RubyLLM.configure do |c|
+      c.openai_api_base = @endpoint
+      c.openai_api_key  = "local"
+      c.openai_use_system_role = true
+    end
+
+    RubyLLM.chat(
+      model: @model,
+      provider: :openai,
+      assume_model_exists: true
+    )
+  end
+
+  # ===========================================================
+  # extras
+  # ===========================================================
+  def reset!
+    @vars = @initial_vars.dup
+    @history.clear
+
+    puts @vars, @history
+  end
+
+  def test_runner(cases: [])
+    TestSuite::Runner.new(
+      agent: self,
+      model: @model,
+      cases: cases
+    )
+  end
+
+  def bootstrap_agent!(system_config_instructions:, domain_specific_knowledge: nil, runtime: nil, capability_schema: nil, extra_vars: {})
+    puts "[LLM] 🚀 bootstrap_agent! (framework bootstrap)"
+
+    @config_path = File.expand_path(system_config_instructions)
+    @domain_specific_knowledge = domain_specific_knowledge && File.expand_path(domain_specific_knowledge)
+
+    initial_vars = load_bootstrap_vars(
+      config_path: @config_path,
+      knowledge_path: @domain_specific_knowledge,
+      capability_schema: capability_schema,
+      extra_vars: extra_vars
+    )
+
+    build_agent(initial_vars: initial_vars, runtime: runtime)
+  end
+
+  def bind_runtime_capabilities!(runtime, capability_schema: nil)
+    attach_runtime(runtime)
+
+    if capability_schema
+      vars["capability_schema"] =
+        capability_schema.is_a?(String) ? capability_schema : JSON.pretty_generate(capability_schema)
+    end
+
+    runtime
+  end
+
+  def execute(code)
+    ctx = @runtime
+    raise "runtime not configured" unless ctx
+
+    vars.each do |k, v|
+      ctx.instance_variable_set("@#{k}", v)
+    end
+
+    result = ctx.instance_eval(code)
+    vars["answer"] = result unless result.nil?
+
+    [result, vars.keys]
+  rescue => e
+    puts "[EXEC ERROR] #{e.class} - #{e.message}"
+    puts e.backtrace.first(10)
+    ["ERROR: #{e.class} - #{e.message}", []]
+  end
+
+  def build_prompt(input)
+    vars_block =
+      if vars.empty?
+        "None"
+      else
+        vars.keys.join(", ")
+      end
+
+    runtime_block =
+      if @runtime_methods.empty?
+        "None"
+      else
+        @runtime_methods.join(", ")
+      end
+
+    [
+      msg(:system, SYSTEM),
+      msg(:system, <<~CTX),
+        Runtime methods (functions you can call directly in Ruby):
+        #{runtime_block}
+
+        Variables (persistent state, read/write):
+        #{vars_block}
+      CTX
+      *history,
+      msg(:user, "Task: #{input}\nNext step:")
+    ]
+  end
+
+  def tool_call?(res)
+    res.respond_to?(:tool_calls) && res.tool_calls && !res.tool_calls.empty?
+  end
+
+  def handle_tool_calls(res)
+    res.tool_calls.each do |call|
+      name = call["name"]
+      args = call["arguments"] || {}
+
+      tool = @tools.find { |t| t.name == name }
+
+      if tool.nil?
+        puts "[TOOL] not found: #{name}"
+        next
+      end
+
+      puts "[TOOL] calling #{name} with #{args}"
+
+      result = tool.execute(**args.transform_keys(&:to_sym))
+
+      puts "[TOOL RESULT] #{result}"
+
+      history << {
+        role: "tool",
+        name: name,
+        content: result.to_s
+      }
+    end
+  rescue => e
+    puts "[TOOL ERROR] #{e.message}"
+  end
+
+  private
+
+  def initialize_llm_backend!
+    return unless @llm_provider == "llama-server"
+
+    initialize_llama_server!
+  end
+
+  def initialize_llama_server!
+    ensure_lms_installed!
+    ensure_llama_server_binary!
+    ensure_llama_server_model_downloaded!
+    ensure_llama_server_http!
+    wait_for_llama_server_models!
+
+    @endpoint = DEFAULT_LLAMA_SERVER_ENDPOINT
+    @model = @llama_server_identifier if presence(@llama_server_identifier)
+  end
+
+  def ensure_lms_installed!
+    return if File.executable?(File.join(LMS_BIN_DIR, "lms")) || command_available?("lms")
+
+    raise "LM Studio CLI não encontrado. Instale pelo script oficial: curl -fsSL https://lmstudio.ai/install.sh | bash"
+  end
+
+  def ensure_llama_server_binary!
+    return if command_available?(LLAMA_SERVER_BIN)
+
+    raise "llama-server não encontrado. Defina GLAUCO_LLAMASERVER_BIN ou instale llama.cpp com o binário llama-server."
+  end
+
+  def ensure_llama_server_model_downloaded!
+    return if resolved_llama_server_model_path
+
+    model_key = presence(@llama_server_model_key)
+    raise "Defina GLAUCO_LLAMASERVER_MODEL_KEY para baixar um modelo GGUF via LM Studio." unless model_key
+
+    download_llama_server_model!(model_key)
+    source_model_path = locate_downloaded_llama_server_model_path
+    raise "O modelo #{model_key} não foi localizado depois do download via LM Studio." unless source_model_path
+
+    FileUtils.mkdir_p(File.dirname(@llama_server_model_path))
+    FileUtils.cp(source_model_path, @llama_server_model_path)
+
+    return if @llama_server_model_path
+
+    raise "O modelo #{model_key} não foi localizado depois do download via LM Studio."
+  end
+
+  def ensure_llama_server_http!
+    return if llama_server_running?
+
+    model_path = resolved_llama_server_model_path
+    raise "Nenhum caminho de modelo GGUF disponível para o llama-server." unless model_path
+
+    FileUtils.mkdir_p(File.dirname(LLAMA_SERVER_LOG))
+
+    args = [
+      LLAMA_SERVER_BIN,
+      "--model", model_path,
+      "--host", DEFAULT_LLAMA_SERVER_HOST,
+      "--port", DEFAULT_LLAMA_SERVER_PORT.to_s,
+      "--alias", @llama_server_identifier.to_s
+    ]
+    args += ["--ctx-size", @llama_server_context_length.to_s] if @llama_server_context_length
+    args += ["--gpu-layers", llama_server_gpu_layers] if @llama_server_gpu
+    args += ["--timeout", @llama_server_ttl.to_s] if @llama_server_ttl
+
+    pid = spawn(
+      args.first,
+      *args.drop(1),
+      in: "/dev/null",
+      out: LLAMA_SERVER_LOG,
+      err: LLAMA_SERVER_LOG,
+      pgroup: true
+    )
+    Process.detach(pid)
+
+    wait_until!("llama-server não iniciou em #{DEFAULT_LLAMA_SERVER_ENDPOINT}", timeout: 30) do
+      llama_server_running?
+    end
+  end
+
+  def wait_for_llama_server_models!
+    wait_until!("llama-server subiu, mas o endpoint /v1/models não ficou pronto.", timeout: 30) do
+      uri = URI("#{DEFAULT_LLAMA_SERVER_ENDPOINT}/models")
+      response = Net::HTTP.get_response(uri)
+      response.is_a?(Net::HTTPSuccess)
+    rescue StandardError
+      false
+    end
+  end
+
+  def llama_server_running?
+    uri = URI("#{DEFAULT_LLAMA_SERVER_ENDPOINT}/models")
+    response = Net::HTTP.get_response(uri)
+    response.is_a?(Net::HTTPSuccess)
+  rescue StandardError
+    false
+  end
+
+  def resolved_llama_server_model_path
+    return @llama_server_model_path if @llama_server_model_path && File.exist?(@llama_server_model_path)
+
+    nil
+  end
+
+  def locate_downloaded_llama_server_model_path
+    return @llama_server_model_path if @llama_server_model_path && File.exist?(@llama_server_model_path)
+
+    models_root = discover_lmstudio_models_root
+    return nil unless models_root && Dir.exist?(models_root)
+
+    search_terms = llama_server_search_terms
+    candidates = Dir.glob(File.join(models_root, "**", "*.gguf"))
+      .reject { |path| File.basename(path).downcase.include?("mmproj") }
+      .select do |path|
+        haystack = path.downcase
+        search_terms.any? { |term| haystack.include?(term) }
+      end
+
+    candidates.min_by { |path| File.size(path) }
+  end
+
+  def run_lms!(*args)
+    run_lms(*args, allow_failure: false)
+  end
+
+  def run_lms(*args, allow_failure:)
+    stdout, stderr, status = Open3.capture3(lms_env, "lms", *args)
+    return stdout if status.success?
+    return stdout if allow_failure
+
+    command = (["lms"] + args).shelljoin
+    details = [stdout, stderr].reject(&:empty?).join("\n").strip
+    raise "Falha ao executar #{command}: #{details}"
+  end
+
+  def lms_env
+    {
+      "PATH" => [LMS_BIN_DIR, ENV["PATH"]].compact.join(":")
+    }
+  end
+
+  def command_available?(name)
+    system({ "PATH" => [LMS_BIN_DIR, ENV["PATH"]].compact.join(":") }, "bash", "-lc", "command -v #{Shellwords.escape(name)} >/dev/null 2>&1")
+  end
+
+  def wait_until!(message, timeout:)
+    Timeout.timeout(timeout) do
+      loop do
+        return true if yield
+        sleep 1
+      end
+    end
+  rescue Timeout::Error
+    raise message
+  end
+
+  def normalize_llm_provider(provider, endpoint)
+    chosen = presence(provider)
+    return chosen if chosen
+    return "llama-server" if endpoint.to_s.start_with?(DEFAULT_LLAMA_SERVER_ENDPOINT)
+
+    nil
+  end
+
+  def download_llama_server_model!(model_key)
+    run_lms("get", model_key, "--gguf", "-y", allow_failure: false)
+  rescue StandardError => first_error
+    fallback_url = huggingface_url_for(model_key)
+    raise first_error unless fallback_url
+
+    run_lms!("get", fallback_url, "--gguf", "-y")
+  end
+
+  def huggingface_url_for(model_key)
+    key = model_key.to_s.strip
+    return nil if key.empty?
+    return nil if key.match?(%r{\Ahttps?://}i)
+    return nil unless key.include?("/")
+
+    "https://huggingface.co/#{key}"
+  end
+
+  def discover_lmstudio_models_root
+    explicit = ENV["LMSTUDIO_MODELS_DIR"].to_s.strip
+    return explicit unless explicit.empty?
+
+    default_root = File.join(Dir.home, ".lmstudio", "models")
+    return default_root if Dir.exist?(default_root)
+
+    candidates = Dir.glob(File.join(Dir.home, ".lmstudio", "**", "model-cache"))
+    return candidates.first if candidates.any?
+
+    settings_path = File.join(Dir.home, ".lmstudio", "settings.json")
+    return nil unless File.exist?(settings_path)
+
+    settings = JSON.parse(File.read(settings_path, encoding: "UTF-8"))
+    presence(settings["downloadedModelsPath"]) || presence(settings["modelsPath"])
   rescue JSON::ParserError
-    { "count" => 0, "frames" => [], "raw" => raw.to_s }
+    nil
   end
 
-  def eval_js_in_frame(frame_ref, js)
-    escaped_frame = frame_ref.to_s.dump
-    escaped_js = js.to_s.dump
+  def llama_server_search_terms
+    key = @llama_server_model_key.to_s.strip
+    return [] if key.empty?
 
-    raw = eval_js(<<~JS)
-      return JSON.stringify((function() {
-        const ref = #{escaped_frame};
-        const code = #{escaped_js};
-        let target = null;
+    stripped = key.sub(%r{\Ahttps?://huggingface\.co/}i, "").sub(%r{\Ahttps?://}, "")
+    candidates = [
+      key,
+      stripped,
+      File.basename(stripped),
+      stripped.split("/").last
+    ]
 
-        if (/^\\d+$/.test(ref)) {
-          target = window.frames[Number(ref)];
-        } else {
-          target = window.frames[ref];
-        }
-
-        if (!target) {
-          return { ok: false, error: "frame not found", ref };
-        }
-
-        try {
-          const result = target.eval(code);
-          return { ok: true, ref, result };
-        } catch (error) {
-          return { ok: false, ref, error: String(error) };
-        }
-      })());
-    JS
-
-    JSON.parse(raw.to_s)
-  rescue JSON::ParserError
-    { "ok" => false, "ref" => frame_ref.to_s, "error" => raw.to_s }
+    candidates
+      .map { |value| value.to_s.downcase.strip }
+      .reject(&:empty?)
+      .uniq
   end
 
-  def frame_support_report(*)
-    GlaucoFramework::ShellCapabilities::FRAME_LIMITATION_NOTE
+  def llama_server_gpu_layers
+    return "999" if @llama_server_gpu == "max"
+    return "0" if @llama_server_gpu == "off"
+
+    ratio = @llama_server_gpu.to_f
+    return "0" if ratio <= 0
+
+    [[(ratio * 100).round, 1].max, 999].min.to_s
   end
 
-  def capability_schema(*)
-    @capability_schema
+  def presence(value)
+    string = value.to_s.strip
+    return nil if string.empty?
+
+    string
+  end
+
+  def integer_or_nil(value)
+    return nil if value.nil? || value.to_s.strip.empty?
+
+    value.to_i
+  end
+
+  def reconfigure_agent!(initial_vars:, runtime:)
+    normalized_vars = initial_vars.transform_keys(&:to_s)
+
+    attach_runtime(runtime)
+
+    @initial_vars = normalized_vars
+    @vars = @initial_vars.dup
+    @history = []
+    @last_code = nil
+
+    self
+  end
+
+  def msg(role, content)
+    { role: role, content: clean_utf8(content) }
+  end
+
+  def extract_repl(text)
+    text.scan(/```(?:repl|ruby)\n(.*?)```/m)
+      .flatten
+      .map { |code| normalize_generated_code(code) }
+      .reject(&:empty?)
+  end
+
+  def clean_utf8(s)
+    s.to_s.dup.force_encoding("UTF-8")
+      .encode("UTF-8", invalid: :replace, undef: :replace, replace: "")
+  end
+
+  def normalize_generated_code(code)
+    normalized = code.to_s.strip
+
+    if normalized.match?(/\A(?:puts|print|p)\s+/)
+      extracted = unwrap_stringified_code(normalized)
+      normalized = extracted if extracted
+    end
+
+    normalized
+  end
+
+  def unwrap_stringified_code(code)
+    match = code.match(/\A(?:puts|print|p)\s+(.+)\z/m)
+    return nil unless match
+
+    literal = match[1].strip
+    return nil unless literal.start_with?('"', "'")
+
+    begin
+      unwrapped = eval(literal)
+    rescue StandardError
+      return nil
+    end
+
+    unwrapped.to_s.strip
+  end
+
+  def load_bootstrap_vars(config_path:, knowledge_path:, capability_schema:, extra_vars:)
+    initial_vars = {}
+
+    unless File.exist?(config_path)
+      raise "system_config_instructions não encontrado: #{config_path}"
+    end
+
+    initial_vars["system_config"] = File.read(config_path, encoding: "UTF-8")
+
+    if knowledge_path && File.exist?(knowledge_path)
+      initial_vars["domain_knowledge"] = File.read(knowledge_path, encoding: "UTF-8")
+    end
+
+    if capability_schema
+      initial_vars["capability_schema"] =
+        capability_schema.is_a?(String) ? capability_schema : JSON.pretty_generate(capability_schema)
+    end
+
+    extra_vars.each do |key, value|
+      initial_vars[key.to_s] = value
+    end
+
+    initial_vars
   end
 end
 
+class GlaucoAgentBrowserEnv < GlaucoBasicPlasticAgent
+  FRAME_LIMITATION_NOTE = "Frames internos via SWT Browser dependem da engine embutida e de same-origin. O schema abaixo prepara introspeccao e avaliacao em frame quando acessivel."
 
-class GUIShell < GlaucoLLM
+  def self.capability(name, description, params: [])
+    {
+      name: name,
+      description: description,
+      params: params
+    }
+  end
+
+  def self.capability_schema_definition
+    {
+      shell: {
+        description: "Capacidades do shell SWT para navegacao, DOM e exploracao de frames.",
+        frame_support: {
+          status: "experimental",
+          notes: FRAME_LIMITATION_NOTE,
+          fallback_paths: [
+            "Migrar a camada de shell para Julia + WebViews quando embutir frames for requisito de primeira linha.",
+            "Explorar Tauri + Leptos para manter avaliacao de JavaScript e rotas desktop com melhor controle de webview."
+          ]
+        },
+        capabilities: [
+          capability("open_url", "Abre uma URL no browser principal.", params: %w[url]),
+          capability("current_url", "Retorna a URL atual do browser principal."),
+          capability("eval_js", "Executa JavaScript no documento principal.", params: %w[js]),
+          capability("read_html", "Le o HTML renderizado da janela atual."),
+          capability("list_frames", "Inspeciona frames acessiveis da janela atual."),
+          capability("eval_js_in_frame", "Executa JavaScript em um frame acessivel por indice ou nome.", params: %w[frame_ref js]),
+          capability("frame_support_report", "Resume limites atuais de frames internos no SWT Browser.")
+        ]
+      }
+    }
+  end
+
   attr_reader :shell, :browser, :display, :overlay_shell, :overlay_browser
   attr_accessor :state, :visible
 
@@ -293,7 +843,7 @@ class GUIShell < GlaucoLLM
       current_url: nil,
       last_action: nil,
       context: {},
-      capability_schema: GlaucoFramework::ShellCapabilities.schema,
+      capability_schema: self.class.capability_schema_definition,
       overlay: {
         visible: false,
         requested_visible: false,
@@ -305,39 +855,27 @@ class GUIShell < GlaucoLLM
 
     start_ui_thread if @visible
 
-    puts "[GUIShell] BEFORE bootstrap_agent!"
-
-    runtime = build_shell_runtime
-    capability_schema = runtime.capability_schema
+    puts "[GlaucoAgentBrowserEnv] BEFORE bootstrap_agent!"
 
     bootstrap_agent!(
       system_config_instructions: File.expand_path("system_config_instructions.md", __dir__),
       domain_specific_knowledge: File.expand_path("dinamicas diretrizes - prompt.md", __dir__),
-      runtime: runtime,
+      runtime: self,
       capability_schema: capability_schema
     )
 
-    puts "[GUIShell] AFTER bootstrap_agent!"
-  end
-
-  def build_shell_runtime
-    ApiRuntime.new(
-      browser: @browser,
-      display: @display,
-      host: self,
-      state: @state
-    )
+    puts "[GlaucoAgentBrowserEnv] AFTER bootstrap_agent!"
   end
 
   # ===========================================================
   # execução
   # ===========================================================
   def interpretar(input_text)
-    raise "runtime não configurado" unless @agent.instance_variable_get(:@runtime)
+    raise "runtime não configurado" unless @runtime
 
     puts "[Interpreter] input_text: #{input_text.inspect}"
 
-    result = @agent.run(input_text)
+    result = run(input_text)
 
     run_ui do
       puts "[UI] browser=#{browser}"
@@ -455,11 +993,128 @@ class GUIShell < GlaucoLLM
   # helpers
   # ===========================================================
   def evaluate(js)
+    ensure_ui_alive
+    raise "browser nil" unless @browser
+
     run_ui { @browser.evaluate(js) }
   end
 
-  def read_html
+  def read_html(*)
     evaluate("return document.documentElement.outerHTML;")
+  end
+
+  def open_url(url)
+    if !@visible && (@ui_thread.nil? || !@ui_thread.alive?)
+      @state[:current_url] = url
+      @state[:last_action] = "open_url_external"
+      system("xdg-open", url)
+      return "opened #{url} externally"
+    end
+
+    ensure_ui_alive
+    raise "browser nil" unless @browser
+
+    run_ui do
+      @state[:current_url] = url
+      @state[:last_action] = "open_url"
+      @browser.setUrl(url)
+    end
+
+    "opened #{url}"
+  end
+
+  def current_url(*)
+    @state[:current_url].to_s
+  end
+
+  def eval_js(js)
+    @state[:last_action] = "eval_js"
+    if !@visible && (@ui_thread.nil? || !@ui_thread.alive?)
+      raise "browser nil: eval_js requer browser embutido. Inicialize com visible: true."
+    end
+
+    ensure_ui_alive
+    raise "browser nil" unless @browser
+
+    run_ui { @browser.evaluate(js) }
+  end
+
+  def list_frames(*)
+    raw = eval_js(<<~JS)
+      return JSON.stringify((function() {
+        const frames = [];
+        for (let index = 0; index < window.frames.length; index += 1) {
+          const frame = window.frames[index];
+          try {
+            frames.push({
+              index,
+              name: frame.name || null,
+              location: frame.location ? frame.location.href : null,
+              accessible: true
+            });
+          } catch (error) {
+            frames.push({
+              index,
+              name: null,
+              location: null,
+              accessible: false,
+              error: String(error)
+            });
+          }
+        }
+
+        return {
+          count: window.frames.length,
+          frames
+        };
+      })());
+    JS
+
+    JSON.parse(raw.to_s)
+  rescue JSON::ParserError
+    { "count" => 0, "frames" => [], "raw" => raw.to_s }
+  end
+
+  def eval_js_in_frame(frame_ref, js)
+    escaped_frame = frame_ref.to_s.dump
+    escaped_js = js.to_s.dump
+
+    raw = eval_js(<<~JS)
+      return JSON.stringify((function() {
+        const ref = #{escaped_frame};
+        const code = #{escaped_js};
+        let target = null;
+
+        if (/^\\d+$/.test(ref)) {
+          target = window.frames[Number(ref)];
+        } else {
+          target = window.frames[ref];
+        }
+
+        if (!target) {
+          return { ok: false, error: "frame not found", ref };
+        }
+
+        try {
+          const result = target.eval(code);
+          return { ok: true, ref, result };
+        } catch (error) {
+          return { ok: false, ref, error: String(error) };
+        }
+      })());
+    JS
+
+    JSON.parse(raw.to_s)
+  rescue JSON::ParserError
+    { "ok" => false, "ref" => frame_ref.to_s, "error" => raw.to_s }
+  end
+
+  def frame_support_report(*)
+    FRAME_LIMITATION_NOTE
+  end
+
+  def capability_schema(*)
+    @state[:capability_schema]
   end
 
   # ===========================================================
@@ -1906,27 +2561,32 @@ end
   end
 
   def async(&block)
+    Frontend.ensure_frontend_runtime!
     $display.async_exec { block.call }
   end
 
+  def self.ensure_frontend_runtime!
+    return if defined?($display) && $display && !$display.isDisposed
 
-  $display = Display.new
-  $shell   = Shell.new($display)
-  $shell.setLayout(FillLayout.new)
-  $surface_parent = Composite.new($shell, 0)
-  $surface_parent.setLayout(nil)
-  $embedded_surfaces = {}
+    $display = Display.new
+    $shell   = Shell.new($display)
+    $shell.setLayout(FillLayout.new)
+    $surface_parent = Composite.new($shell, 0)
+    $surface_parent.setLayout(nil)
+    $embedded_surfaces = {}
 
-  $browser = Browser.new($surface_parent, 0)
-  $root    = RootRenderer.new($browser)
+    $browser = Browser.new($surface_parent, 0)
+    $root    = RootRenderer.new($browser)
 
-  frontend_resize_listener = Listener.impl { |_event| Frontend.sync_frontend_layout! rescue nil }
-  $shell.addListener(SWT::Resize, frontend_resize_listener)
-  $surface_parent.addListener(SWT::Resize, frontend_resize_listener)
-  
-  Thread.new { server.start }
+    frontend_resize_listener = Listener.impl { |_event| Frontend.sync_frontend_layout! rescue nil }
+    $shell.addListener(SWT::Resize, frontend_resize_listener)
+    $surface_parent.addListener(SWT::Resize, frontend_resize_listener)
+
+    @server_thread ||= Thread.new { server.start }
+  end
 
   def self.start!
+    ensure_frontend_runtime!
     $shell.open
     sync_frontend_layout!
     $display.async_exec do
@@ -1936,6 +2596,7 @@ end
   end
   
   def self.run_loop
+		ensure_frontend_runtime!
 		while !$shell.disposed?
 			$display.sleep unless $display.read_and_dispatch
 		end
