@@ -11,9 +11,9 @@ Consult sample.rb for usage example
 O projeto agora usa, por padrao:
 
 - `OLLAMA_HOST=http://127.0.0.1:11434`
-- `OLLAMA_MODEL=gemma4:e2b`
+- `OLLAMA_MODEL=gemma4:e4b`
 
-O menor Gemma 4 oficial no Ollama hoje e `gemma4:e2b` (7.2 GB):
+O default do projeto agora e `gemma4:e4b`, o proximo tamanho acima do `e2b`:
 https://ollama.com/library/gemma4
 
 ### Preparacao
@@ -21,7 +21,7 @@ https://ollama.com/library/gemma4
 ```bash
 cd /home/usuario/dev/glauco-asked-ruby
 RBENV_VERSION=jruby-10.0.4.0 bundle install
-ollama pull gemma4:e2b
+ollama pull gemma4:e4b
 ```
 
 ### Subir o app

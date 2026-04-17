@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 export OLLAMA_HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
-export OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:e2b}"
+export OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:e4b}"
 export RBENV_VERSION="${RBENV_VERSION:-jruby-10.0.4.0}"
 
 cd "$ROOT_DIR"

@@ -2,6 +2,17 @@
 
 Medicao local feita em `2026-04-17` no fluxo do `GlaucoBasicPlasticAgent` com `GlaucoAgentBrowserEnv` e backend local de modelo.
 
+## Escopo da medicao
+
+Esta medicao foi feita com o modelo `gemma-4-e2b-it`, que era o default naquele momento.
+
+O default atual do projeto foi promovido depois para um modelo acima:
+
+- Ollama: `gemma4:e4b`
+- llama-server / GGUF: `gemma-4-e4b-it`
+
+Entao os numeros abaixo servem como baseline historica do `e2b`, nao como custo atualizado do default atual `e4b`.
+
 ## Custo do framework
 
 O fluxo medido parte da instancia do `GlaucoBasicPlasticAgent`, que hoje absorve o runtime antes exposto separadamente como `RLM`. No boot observado pelo frontend, a sequencia registrada foi:

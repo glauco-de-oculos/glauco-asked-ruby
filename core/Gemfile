@@ -5,4 +5,3 @@ platforms :jruby do
 end
 
 eval_gemfile File.expand_path("framework/Gemfile", __dir__)
-eval_gemfile File.expand_path("llm/Gemfile", __dir__)

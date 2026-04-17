@@ -36,13 +36,13 @@ java_import 'org.eclipse.swt.dnd.TextTransfer'
 class GlaucoBasicPlasticAgent
   raw_ollama_host = ENV.fetch("OLLAMA_HOST", "http://127.0.0.1:11434").sub(%r{/*$}, "")
   DEFAULT_OPENAI_COMPAT_ENDPOINT = raw_ollama_host.sub(%r{/v1$}, "") + "/v1"
-  DEFAULT_MODEL_NAME = ENV.fetch("OLLAMA_MODEL", "gemma4:e2b")
+  DEFAULT_MODEL_NAME = ENV.fetch("OLLAMA_MODEL", "gemma4:e4b")
   DEFAULT_LLAMA_SERVER_HOST = ENV.fetch("GLAUCO_LLAMASERVER_HOST", "127.0.0.1")
   DEFAULT_LLAMA_SERVER_PORT = ENV.fetch("GLAUCO_LLAMASERVER_PORT", "1234").to_i
   DEFAULT_LLAMA_SERVER_ENDPOINT = ENV.fetch("GLAUCO_LLAMASERVER_ENDPOINT", "http://#{DEFAULT_LLAMA_SERVER_HOST}:#{DEFAULT_LLAMA_SERVER_PORT}/v1")
-  DEFAULT_LLAMA_SERVER_MODEL_KEY = ENV.fetch("GLAUCO_LLAMASERVER_MODEL_KEY", "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF")
+  DEFAULT_LLAMA_SERVER_MODEL_KEY = ENV.fetch("GLAUCO_LLAMASERVER_MODEL_KEY", "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF")
   FRAMEWORK_MODELS_DIR = File.join(__dir__, "models")
-  FRAMEWORK_LLAMA_SERVER_MODEL_PATH = ENV.fetch("GLAUCO_LLAMASERVER_LOCAL_MODEL_PATH", File.join(FRAMEWORK_MODELS_DIR, "gemma-4-e2b-it.gguf"))
+  FRAMEWORK_LLAMA_SERVER_MODEL_PATH = ENV.fetch("GLAUCO_LLAMASERVER_LOCAL_MODEL_PATH", File.join(FRAMEWORK_MODELS_DIR, "gemma-4-e4b-it.gguf"))
   LMS_BIN_DIR = File.join(Dir.home, ".lmstudio", "bin")
   LLAMA_SERVER_BIN = ENV.fetch("GLAUCO_LLAMASERVER_BIN", "llama-server")
   LLAMA_SERVER_LOG = File.join(Dir.home, ".lmstudio", "logs", "glauco-llama-server.log")
@@ -877,11 +877,13 @@ class GlaucoAgentBrowserEnv < GlaucoBasicPlasticAgent
     super()
 
     @visible = visible
+    capability_schema = self.class.capability_schema_definition
+
     @state = {
       current_url: nil,
       last_action: nil,
       context: {},
-      capability_schema: self.class.capability_schema_definition,
+      capability_schema: capability_schema,
       overlay: {
         visible: false,
         requested_visible: false,
