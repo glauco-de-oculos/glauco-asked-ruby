@@ -37,9 +37,9 @@ cd /home/usuario/dev/glauco-asked-ruby
 OLLAMA_HOST=http://192.168.0.10:11434 OLLAMA_MODEL=gemma4:e4b ./bin/floating-chat-ollama
 ```
 
-## Llama Server local
+## Custos locais do framework
 
-Foi documentada uma medicao local do backend `llama-server` carregando o GGUF do proprio framework em [docs/llama-server-performance.md](/home/usuario/dev/glauco-asked-ruby/docs/llama-server-performance.md).
+Foi documentada uma medicao local de custo do framework, frontend e instancia do modelo em [docs/framework-costs.md](/home/usuario/dev/glauco-asked-ruby/docs/framework-costs.md).
 
 ## Lisp/JVM direction
 
