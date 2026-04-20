@@ -12,6 +12,7 @@ core/models/*.*
 core/framework/models/*.gguf
 core/llamacpp/*.*
 *.jar
+*.gem
 runtime
 floating-chat-app.err.log
 floating-chat-app.out.log

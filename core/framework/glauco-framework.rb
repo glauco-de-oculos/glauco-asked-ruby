@@ -1596,8 +1596,14 @@ module Frontend
     Logger: WEBrick::Log.new(nil, 0)
   )
 
+  @server = server
+
   def self.server_port
     @server_port
+  end
+
+  def self.server
+    @server
   end
 
   def self.base_url
@@ -1903,6 +1909,7 @@ module CarbonRegistry
   HTML_TAGS = Set.new(%w[
     html head body title meta link style script
     div span p a strong button
+    input textarea
     form label fieldset legend
     ul ol li
     main section article aside footer
@@ -1920,6 +1927,12 @@ module CarbonRegistry
   class << self
     attr_accessor :css_src, :js_src
     attr_reader :available_tags, :map
+  end
+
+  def self.asset_url(path)
+    return path unless path.to_s.start_with?("/")
+
+    "#{Frontend.base_url}#{path}"
   end
 
   # ===========================================================
@@ -2020,12 +2033,12 @@ module CarbonRegistry
   # ===========================================================
   def self.script_tag
     log "injecting script: #{@js_src}"
-    %(<script type="module" src="#{@js_src}"></script>)
+    %(<script type="module" src="#{asset_url(@js_src)}"></script>)
   end
 
   def self.style_tag
     log "injecting css: #{@css_src}"
-    %(<link rel="stylesheet" href="#{@css_src}">)
+    %(<link rel="stylesheet" href="#{asset_url(@css_src)}">)
   end
 
   def self.defined_style_tag
@@ -2053,7 +2066,17 @@ end
         begin
           arg = args.first
           arg = arg[0] if arg.is_a?(Java::JavaLang::Object[]) && arg.size == 1
-          $callbacks[callback_name].call(arg)
+          if defined?($display) && $display && !$display.isDisposed
+            $display.async_exec do
+              begin
+                $callbacks[callback_name].call(arg)
+              rescue => e
+                puts "Error in async callback #{callback_name}: #{e.class} - #{e.message}"
+              end
+            end
+          else
+            $callbacks[callback_name].call(arg)
+          end
         rescue => e
           puts "Error in callback #{callback_name}: #{e.class} - #{e.message}"
         end
@@ -2096,6 +2119,7 @@ end
         <html theme="g100">
           <head>
             <meta charset="UTF-8">
+            <base href="#{Frontend.base_url}/">
             #{CarbonRegistry.style_tag}
             #{CarbonRegistry.script_tag}
             #{CarbonRegistry.defined_style_tag}
@@ -2115,7 +2139,7 @@ end
         </html>
       HTML
 
-      File.write(File.join(PUBLIC_DIR, "index.html"), html)
+      @browser.setText(html)
     end
   end
 
@@ -2201,6 +2225,21 @@ end
       end
     end
 
+    def capture_rendered_nodes
+      @capture_buffers ||= []
+      @capture_buffers << []
+      result = yield
+      captured_nodes = @capture_buffers.pop
+      nodes = captured_nodes.empty? ? result : captured_nodes
+      render_nodes(nodes)
+    end
+
+    def append_captured_node(node)
+      return unless @capture_buffers && !@capture_buffers.empty?
+
+      @capture_buffers.last << node
+    end
+
     def bind(state_key, node, &block)
       state_path = state_key.is_a?(StatePath) ? state_key : StatePath.new(state_key)
       path_str = state_path.to_s
@@ -2216,13 +2255,15 @@ end
       value = dig_state_path(state_path)
 
       begin
-        inner_html = render_binding_result(block.call(value))
+        inner_html = capture_rendered_nodes { render_binding_result(block.call(value)) }
       rescue => e
         puts "⚠️ Erro ao executar binding para #{path_str}: #{e.class} - #{e.message}"
         inner_html = ""
       end
 
-      node_html.sub(%r{</[a-zA-Z0-9\-_]+>}, inner_html + '\0')
+      bound_html = node_html.sub(%r{</[a-zA-Z0-9\-_]+>}, inner_html + '\0')
+      append_captured_node(bound_html)
+      bound_html
     end
 
     def dig_state_path(state_path)
@@ -2327,7 +2368,7 @@ end
 
       begin
         puts "Binding found for #{path_str}, updating DOM with value: #{value.inspect}" if DEBUG
-        inner_html = render_binding_result(binding[:block].call(value))
+        inner_html = capture_rendered_nodes { render_binding_result(binding[:block].call(value)) }
       rescue => e
         puts "⚠️ Erro ao renderizar binding #{path_str}: #{e.class} - #{e.message}"
         inner_html = ""
@@ -2342,7 +2383,21 @@ end
         })();
       JS
 
-      @parent_renderer&.browser&.execute(js)
+      browser = @parent_renderer&.browser
+      return path_str unless browser
+
+      if defined?($display) && $display && !$display.isDisposed
+        $display.async_exec do
+          begin
+            browser.execute(js) unless browser.isDisposed
+          rescue => e
+            puts "⚠️ Erro ao executar update JS para #{path_str}: #{e.class} - #{e.message}"
+          end
+        end
+      else
+        browser.execute(js)
+      end
+
       path_str
     end
 
@@ -2422,7 +2477,7 @@ end
 
       inner_content =
         if block
-          render_nodes(instance_eval(&block))
+          capture_rendered_nodes { instance_eval(&block) }
         else
           content_or_attrs.is_a?(Component) ? content_or_attrs.render_to_html : content_or_attrs.to_s
         end
@@ -2441,11 +2496,15 @@ end
         end
       end.compact.join(" ")
 
-      if html_attrs.empty?
-        "<#{resolved_name}>#{inner_content}</#{resolved_name}>"
-      else
-        "<#{resolved_name} #{html_attrs}>#{inner_content}</#{resolved_name}>"
-      end
+      html =
+        if html_attrs.empty?
+          "<#{resolved_name}>#{inner_content}</#{resolved_name}>"
+        else
+          "<#{resolved_name} #{html_attrs}>#{inner_content}</#{resolved_name}>"
+        end
+
+      append_captured_node(html)
+      html
     end
 
     def p(*args, **attrs, &block)
@@ -2500,7 +2559,7 @@ end
       host_content = attrs.delete(:host_content) || ""
       embedded_html =
         if block
-          build_embedded_browser_document(render_nodes(instance_eval(&block)))
+          build_embedded_browser_document(capture_rendered_nodes { instance_eval(&block) })
         elsif html
           warn "[embedded_browser_element] html: está deprecado; prefira conteúdo via bloco de tags."
           html
@@ -2569,7 +2628,7 @@ end
     def render_to_html
       @children = []
       return "" unless @render_block
-      instance_eval(&@render_block).to_s
+      capture_rendered_nodes { instance_eval(&@render_block) }
     end
 
     def ui(&block)
@@ -2605,6 +2664,59 @@ end
     $display.async_exec { block.call }
   end
 
+  def self.hmr_entry_file
+    @hmr_entry_file ||= File.expand_path($0.to_s)
+  end
+
+  def self.hmr_watch_paths
+    entry = hmr_entry_file
+    app_dir = File.dirname(entry)
+    Dir.glob(File.join(app_dir, "**", "*.rb")).map { |path| File.expand_path(path) }.uniq.sort
+  end
+
+  def self.hmr_snapshot(paths = hmr_watch_paths)
+    paths.to_h do |path|
+      [path, File.exist?(path) ? File.mtime(path) : Time.at(0)]
+    end
+  end
+
+  def self.ensure_hmr_watcher!
+    return if @hmr_thread && @hmr_thread.alive?
+
+    watch_paths = hmr_watch_paths
+    return if watch_paths.empty?
+
+    mtimes = hmr_snapshot(watch_paths)
+
+    @hmr_thread = Thread.new do
+      loop do
+        sleep 0.6
+
+        latest_paths = hmr_watch_paths
+        latest_snapshot = hmr_snapshot(latest_paths)
+        changed = latest_paths != watch_paths || latest_snapshot != mtimes
+
+        watch_paths = latest_paths
+        mtimes = latest_snapshot
+
+        next unless changed
+
+        begin
+          $display.async_exec do
+            begin
+              load hmr_entry_file
+              puts "[HMR] reload aplicado"
+            rescue SyntaxError, StandardError => e
+              warn "[HMR] falha ao recarregar: #{e.class} - #{e.message}"
+            end
+          end
+        rescue StandardError => e
+          warn "[HMR] falha ao agendar reload: #{e.class} - #{e.message}"
+        end
+      end
+    end
+  end
+
   def self.ensure_frontend_runtime!
     return if defined?($display) && $display && !$display.isDisposed
 
@@ -2627,11 +2739,12 @@ end
 
   def self.start!
     ensure_frontend_runtime!
+    ensure_hmr_watcher!
+    return if defined?(@run_loop_started) && @run_loop_started
+
+    @run_loop_started = true
     $shell.open
     sync_frontend_layout!
-    $display.async_exec do
-      $browser.setUrl("#{base_url}/index.html")
-    end
     self.run_loop
   end
   
