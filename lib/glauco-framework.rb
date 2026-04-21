@@ -1,5 +1,6 @@
 require "bundler" rescue nil
 require "fileutils"
+require "tmpdir"
 require_relative "glauco/framework/version"
 
 module Glauco
@@ -21,6 +22,8 @@ module Glauco
       else
         Dir.pwd
       end
+    rescue Bundler::GemfileNotFound
+      Dir.pwd
     end
 
     def app_public_dir
@@ -44,6 +47,26 @@ module Glauco
       FileUtils.rm_f(stale_index)
     end
 
+    def ensure_packaged_llama_server!
+      return unless blank?(ENV["GLAUCO_LLAMASERVER_BIN"])
+
+      source = File.join(GEM_ROOT, "bin", "llama-server")
+      return unless File.exist?(source)
+
+      target_dir = File.join(Dir.tmpdir, "glauco-framework-runtime")
+      target = File.join(target_dir, "llama-server")
+      FileUtils.mkdir_p(target_dir)
+
+      if !File.exist?(target) || File.size(target) != File.size(source)
+        File.binwrite(target, File.binread(source))
+        FileUtils.chmod(0o755, target)
+      end
+
+      ENV["GLAUCO_LLAMASERVER_BIN"] = target
+    rescue StandardError => e
+      warn "[Glauco::Framework] falha ao preparar llama-server empacotado: #{e.class} - #{e.message}"
+    end
+
     def blank?(value)
       value.nil? || value.strip.empty?
     end
@@ -58,5 +81,6 @@ FRAMEWORK_WEB_DIR = Glauco::Framework::WEB_ROOT unless defined?(FRAMEWORK_WEB_DI
 NODE_MODULES_DIR = File.join(FRAMEWORK_WEB_DIR, "node_modules") unless defined?(NODE_MODULES_DIR)
 
 Glauco::Framework.ensure_public_assets!
+Glauco::Framework.ensure_packaged_llama_server!
 
 require File.join(Glauco::Framework::FRAMEWORK_ROOT, "glauco-framework")

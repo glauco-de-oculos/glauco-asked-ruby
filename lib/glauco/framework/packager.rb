@@ -31,11 +31,13 @@ module Glauco
         work_root = File.join(project_root, "build", "packaging", slug)
         launcher_path = File.join(work_root, "launcher.rb")
         warble_config_path = File.join(work_root, "warble.dynamic.rb")
+        framework_runtime_root = File.join(work_root, "glauco-framework")
 
         FileUtils.rm_rf(work_root)
         FileUtils.mkdir_p(work_root)
-        write_launcher(launcher_path)
-        write_warble_config(warble_config_path, launcher_path)
+        stage_framework_runtime(framework_runtime_root)
+        write_launcher(launcher_path, framework_runtime_root)
+        write_warble_config(warble_config_path, launcher_path, framework_runtime_root)
         build_jar(warble_config_path)
 
         write_container_artifacts if write_container_files
@@ -118,12 +120,35 @@ module Glauco
         root_jar = File.join(project_root, "#{slug}.jar")
         FileUtils.rm_f(root_jar)
 
-        env = { "GLAUCO_WARBLE_CONFIG" => warble_config_path }
-        system(env, RbConfig.ruby, "-S", "warble", "executable", "jar", chdir: project_root)
+        with_warble_config(warble_config_path) do
+          system(RbConfig.ruby, "-S", "warble", "executable", "jar", chdir: project_root)
+        end
         raise ArgumentError, "Falha ao gerar jar com warbler." unless $CHILD_STATUS.success?
         raise ArgumentError, "Warbler nao gerou #{root_jar}." unless File.exist?(root_jar)
 
         FileUtils.mv(root_jar, jar_path, force: true)
+      end
+
+      def with_warble_config(warble_config_path)
+        config_dir = File.join(project_root, "config")
+        target = File.join(config_dir, "warble.rb")
+        backup = nil
+
+        FileUtils.mkdir_p(config_dir)
+        if File.exist?(target)
+          backup = File.join(Dir.tmpdir, "glauco-warble-#{Process.pid}-#{Time.now.to_i}.rb")
+          FileUtils.cp(target, backup)
+        end
+
+        FileUtils.cp(warble_config_path, target)
+        yield
+      ensure
+        if backup && File.exist?(backup)
+          FileUtils.cp(backup, target)
+          FileUtils.rm_f(backup)
+        else
+          FileUtils.rm_f(target)
+        end
       end
 
       def ensure_build_runtime!
@@ -150,17 +175,19 @@ module Glauco
         false
       end
 
-      def write_launcher(path)
+      def write_launcher(path, framework_runtime_root)
         File.write(
           path,
           <<~RUBY
-            $LOAD_PATH.unshift(File.expand_path(#{project_root.inspect}))
-            load File.expand_path(#{entry_path.inspect}, #{project_root.inspect})
+            packaged_root = File.expand_path("../../..", __dir__)
+            $LOAD_PATH.unshift(File.expand_path("glauco-framework/lib", __dir__))
+            $LOAD_PATH.unshift(packaged_root)
+            load File.expand_path(#{entry_path.inspect}, packaged_root)
           RUBY
         )
       end
 
-      def write_warble_config(path, launcher_path)
+      def write_warble_config(path, launcher_path, framework_runtime_root)
         File.write(
           path,
           <<~RUBY
@@ -178,6 +205,9 @@ module Glauco
               )
 
               config.jar_name = #{slug.inspect}
+              config.dirs += [
+                #{path_for_warbler(framework_runtime_root).inspect}
+              ]
               config.gem_excludes = [
                 %r{(^|/)spec(/|$)},
                 %r{(^|/)test(/|$)},
@@ -192,10 +222,93 @@ module Glauco
         )
       end
 
+      def stage_framework_runtime(target_root)
+        gem_root = framework_gem_root
+        FileUtils.mkdir_p(target_root)
+
+        framework_runtime_entries.each do |entry|
+          source = File.join(gem_root, entry)
+          next unless File.exist?(source)
+
+          target = File.join(target_root, entry)
+          FileUtils.mkdir_p(File.dirname(target))
+          FileUtils.cp_r(source, target)
+        end
+
+        stage_llama_server_binary(target_root)
+        prune_framework_runtime(target_root)
+      end
+
       def path_for_warbler(path)
         Pathname.new(path).relative_path_from(Pathname.new(project_root)).to_s.tr("\\", "/")
       rescue ArgumentError
         path
+      end
+
+      def framework_runtime_entries
+        [
+          "core/framework",
+          "bin",
+          "jarlibs",
+          "lib",
+          "pipeline/executables/bin",
+          "public"
+        ]
+      end
+
+      def prune_framework_runtime(target_root)
+        source_node_modules = File.join(framework_gem_root, "core/framework/web/node_modules")
+        target_node_modules = File.join(target_root, "core/framework/web/node_modules")
+
+        FileUtils.rm_rf(File.join(target_root, "core/framework/web/node_modules"))
+        copy_framework_web_asset(
+          source_node_modules,
+          target_node_modules,
+          "@carbon/web-components/custom-elements.json"
+        )
+        copy_framework_web_asset(
+          source_node_modules,
+          target_node_modules,
+          "@carbon/styles/css"
+        )
+
+        Dir.glob(File.join(target_root, "core/framework/models/*.gguf")).each do |model_path|
+          next if File.basename(model_path) == "gemma-4-e4b-it.gguf"
+
+          FileUtils.rm_f(model_path)
+        end
+      end
+
+      def stage_llama_server_binary(target_root)
+        binary = ENV["GLAUCO_LLAMASERVER_BIN"]
+        binary = find_executable("llama-server") if binary.nil? || binary.strip.empty?
+        return unless binary && File.executable?(binary)
+
+        target = File.join(target_root, "bin", "llama-server")
+        FileUtils.mkdir_p(File.dirname(target))
+        FileUtils.cp(binary, target)
+        FileUtils.chmod(0o755, target)
+      end
+
+      def find_executable(name)
+        ENV.fetch("PATH", "").split(File::PATH_SEPARATOR).each do |dir|
+          candidate = File.join(dir, name)
+          return candidate if File.executable?(candidate)
+        end
+        nil
+      end
+
+      def copy_framework_web_asset(source_node_modules, target_node_modules, relative_path)
+        source = File.join(source_node_modules, relative_path)
+        return unless File.exist?(source)
+
+        target = File.join(target_node_modules, relative_path)
+        FileUtils.mkdir_p(File.dirname(target))
+        FileUtils.cp_r(source, target)
+      end
+
+      def framework_gem_root
+        File.expand_path("../../..", __dir__)
       end
 
       def write_container_artifacts
@@ -210,16 +323,44 @@ module Glauco
 
           WORKDIR /app
 
-          RUN addgroup --system --gid 10001 glauco \\
-           && adduser --system --uid 10001 --ingroup glauco glauco
+          RUN apt-get update \\
+           && apt-get install -y --no-install-recommends \\
+              xvfb \\
+              xauth \\
+              libgtk-3-0 \\
+              libwebkit2gtk-4.1-0 \\
+              libxtst6 \\
+              libxrender1 \\
+              libxi6 \\
+              libxrandr2 \\
+              libxss1 \\
+              libasound2t64 \\
+              fonts-dejavu-core \\
+           && rm -rf /var/lib/apt/lists/* \\
+           && addgroup --system --gid 10001 glauco \\
+           && adduser --system --uid 10001 --ingroup glauco --home /home/glauco glauco \\
+           && mkdir -p /home/glauco /app/tmp \\
+           && chown -R 10001:10001 /home/glauco /app/tmp
 
           COPY #{File.basename(jar_path)} /app/#{File.basename(jar_path)}
+          RUN printf '%s\\n' \\
+              '#!/usr/bin/env sh' \\
+              'set -eu' \\
+              'if [ "${GLAUCO_USE_HOST_DISPLAY:-0}" = "1" ]; then' \\
+              '  exec java -jar /app/#{File.basename(jar_path)}' \\
+              'fi' \\
+              'exec xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24 -nolisten tcp" java -jar /app/#{File.basename(jar_path)}' \\
+              > /app/glauco-entrypoint \\
+           && chmod +x /app/glauco-entrypoint
 
-          ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75 -Dfile.encoding=UTF-8 -Djava.io.tmpdir=/tmp"
+          ENV HOME=/home/glauco
+          ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75 -Dfile.encoding=UTF-8 -Djava.io.tmpdir=/app/tmp -Dorg.eclipse.swt.browser.DefaultType=webkit"
+          ENV SWT_GTK3=1
+          ENV DISPLAY=:99
 
           USER 10001:10001
 
-          ENTRYPOINT ["java", "-jar", "/app/#{File.basename(jar_path)}"]
+          ENTRYPOINT ["/app/glauco-entrypoint"]
         DOCKERFILE
       end
 
@@ -280,8 +421,20 @@ module Glauco
                     volumeMounts:
                       - name: tmp
                         mountPath: /tmp
+                      - name: app-tmp
+                        mountPath: /app/tmp
+                      - name: home
+                        mountPath: /home/glauco
+                      - name: public
+                        mountPath: /app/public
                 volumes:
                   - name: tmp
+                    emptyDir: {}
+                  - name: app-tmp
+                    emptyDir: {}
+                  - name: home
+                    emptyDir: {}
+                  - name: public
                     emptyDir: {}
         YAML
       end

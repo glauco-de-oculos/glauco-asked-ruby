@@ -22,6 +22,7 @@ Gem::Specification.new do |spec|
     "public/**/*",
     "README.md"
   ].select { |path| File.file?(path) }
+   .reject { |path| path.start_with?("core/framework/web/node_modules/") }
 
   spec.bindir = "exe"
   spec.executables = ["glauco-package"]

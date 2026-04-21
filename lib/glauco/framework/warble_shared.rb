@@ -25,7 +25,6 @@ module Glauco
           "app",
           "bin",
           "config",
-          "core",
           "examples",
           "jarlibs",
           "lib",
@@ -45,6 +44,8 @@ module Glauco
 
         excludes << "core/framework/web/node_modules/.bin" if File.exist?(node_modules_bin)
         excludes << "core/framework/web/node_modules/**/*.map" if File.exist?(node_modules_maps)
+        excludes << "dist"
+        excludes << "dist/**/*"
         excludes
       end
 

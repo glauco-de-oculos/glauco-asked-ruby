@@ -59,6 +59,10 @@ jobs:
         shell: pwsh
         run: npm run web:build
 
+      - name: Test package artifacts
+        shell: pwsh
+        run: npm run test:package
+
       - name: Install Warbler
         shell: pwsh
         run: jruby -S gem install warbler --no-document

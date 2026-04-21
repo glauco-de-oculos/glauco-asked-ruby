@@ -3,6 +3,7 @@
   "private": true,
   "scripts": {
     "build": "bundle exec glauco-package build --entry bin/main.rb --app-name glauco-app --output dist --image ghcr.io/CHANGE_ME/glauco/glauco-app:latest --namespace glauco",
+    "test:package": "ruby -Ilib:test test/packager_package_test.rb",
     "web:install": "npm --prefix core/framework/web install",
     "web:build": "npm --prefix core/framework/web run build:carbon"
   }

@@ -16,7 +16,8 @@ require 'ruby_llm'
 require 'shellwords'
 require 'timeout'
 require 'uri'
-require File.join(JARLIBS_DIR, 'swt.jar')
+swt_jar = Gem.win_platform? ? "swt-win32.jar" : "swt.jar"
+require File.join(JARLIBS_DIR, swt_jar)
 
 java_import 'org.eclipse.swt.widgets.Display'
 java_import 'org.eclipse.swt.widgets.Shell'
