@@ -1,0 +1,101 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: glauco
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: glauco-app
+  namespace: glauco
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: glauco-app-config
+  namespace: glauco
+data:
+  OLLAMA_HOST: "http://ollama.glauco.svc.cluster.local:11434"
+  OLLAMA_MODEL: "gemma4:e4b"
+  JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -Dfile.encoding=UTF-8 -Djava.io.tmpdir=/tmp"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: glauco-app
+  namespace: glauco
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: glauco-app
+  template:
+    metadata:
+      labels:
+        app: glauco-app
+    spec:
+      serviceAccountName: glauco-app
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: glauco-app
+          image: ghcr.io/YOUR_ORG/glauco/glauco-app:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: glauco-app-config
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: glauco-app
+  namespace: glauco
+spec:
+  podSelector:
+    matchLabels:
+      app: glauco-app
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: glauco
+      ports:
+        - protocol: TCP
+          port: 11434

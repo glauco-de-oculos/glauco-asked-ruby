@@ -1,0 +1,6 @@
+*
+!deploy/
+!deploy/kubernetes/
+!deploy/kubernetes/Dockerfile
+!dist/
+!dist/*.jar

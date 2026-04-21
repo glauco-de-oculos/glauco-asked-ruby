@@ -15,6 +15,7 @@ Gem::Specification.new do |spec|
   spec.files = Dir[
     "bin/*",
     "core/framework/**/*",
+    "exe/*",
     "jarlibs/**/*",
     "lib/**/*",
     "pipeline/executables/bin/*",
@@ -22,6 +23,8 @@ Gem::Specification.new do |spec|
     "README.md"
   ].select { |path| File.file?(path) }
 
+  spec.bindir = "exe"
+  spec.executables = ["glauco-package"]
   spec.require_paths = ["lib"]
 
   spec.add_dependency "docx", "~> 0.10"

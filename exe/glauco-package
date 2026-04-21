@@ -1,0 +1,7 @@
+#!/usr/bin/env ruby
+
+require "English"
+$LOAD_PATH.unshift(File.expand_path("../lib", __dir__))
+require "glauco/framework/packager"
+
+exit(Glauco::Framework::Packager.run(ARGV))

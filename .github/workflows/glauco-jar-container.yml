@@ -1,0 +1,150 @@
+name: glauco-jar-container
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "bin/**"
+      - "core/**"
+      - "jarlibs/**"
+      - "lib/**"
+      - "pipeline/**"
+      - "public/**"
+      - "deploy/kubernetes/**"
+      - ".github/workflows/glauco-jar-container.yml"
+      - "warble.rb"
+      - "config/warble.rb"
+      - "Gemfile"
+      - "Gemfile.lock"
+      - "glauco-framework.gemspec"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  package:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: core/framework/web/package-lock.json
+
+      - name: Setup JRuby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: jruby-10.0.4.0
+          bundler-cache: true
+
+      - name: Install web dependencies
+        shell: pwsh
+        run: npm run web:install
+
+      - name: Build web assets
+        shell: pwsh
+        run: npm run web:build
+
+      - name: Install Warbler
+        shell: pwsh
+        run: jruby -S gem install warbler --no-document
+
+      - name: Package jar
+        shell: pwsh
+        run: >
+          ./pipeline/scripts/package_glauco_app.ps1
+          -ScriptPath bin/main.rb
+          -AppName glauco-app
+          -OutputDir dist
+          -SkipJlink
+          -SkipJpackage
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: glauco-app-jar
+          path: dist/glauco-app.jar
+
+  containerize:
+    runs-on: ubuntu-latest
+    needs: package
+
+    outputs:
+      image_name: ${{ steps.meta.outputs.image_name }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download jar
+        uses: actions/download-artifact@v4
+        with:
+          name: glauco-app-jar
+          path: dist
+
+      - name: Compute image coordinates
+        id: meta
+        shell: bash
+        run: |
+          echo "image_name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/glauco/glauco-app" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/kubernetes/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image_name }}:${{ steps.meta.outputs.image_tag }}
+            ${{ steps.meta.outputs.image_name }}:latest
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: containerize
+    if: github.ref == 'refs/heads/main' && secrets.KUBECONFIG_B64 != ''
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Configure kubeconfig
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 --decode > "$HOME/.kube/config"
+
+      - name: Apply manifests
+        shell: bash
+        run: |
+          sed \
+            "s#ghcr.io/YOUR_ORG/glauco/glauco-app:latest#${{ needs.containerize.outputs.image_name }}:${{ needs.containerize.outputs.image_tag }}#g" \
+            deploy/kubernetes/glauco-app.yaml | kubectl apply -f -
