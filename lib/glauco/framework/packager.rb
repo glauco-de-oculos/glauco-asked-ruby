@@ -12,9 +12,9 @@ require_relative "warble_shared"
 module Glauco
   module Framework
     class Packager
-      attr_reader :project_root, :entry_path, :app_name, :output_dir, :image, :namespace, :base_image
+      attr_reader :project_root, :entry_path, :app_name, :output_dir, :image, :namespace, :base_image, :agent_runtime
 
-      def initialize(project_root:, entry_path:, app_name:, output_dir:, image:, namespace:, base_image:)
+      def initialize(project_root:, entry_path:, app_name:, output_dir:, image:, namespace:, base_image:, agent_runtime: "auto")
         @project_root = File.expand_path(project_root)
         @entry_path = normalize_entry(entry_path)
         @app_name = app_name
@@ -22,6 +22,7 @@ module Glauco
         @image = image
         @namespace = namespace
         @base_image = base_image
+        @agent_runtime = agent_runtime.to_s
       end
 
       def build(write_container_files: true)
@@ -75,7 +76,8 @@ module Glauco
           output_dir: "dist",
           image: "ghcr.io/CHANGE_ME/glauco/glauco-app:latest",
           namespace: "glauco",
-          base_image: "eclipse-temurin:21-jre"
+          base_image: "eclipse-temurin:21-jre",
+          agent_runtime: "auto"
         }
 
         parser = OptionParser.new do |opts|
@@ -87,6 +89,7 @@ module Glauco
           opts.on("--image NAME", "Imagem OCI para o manifesto") { |value| options[:image] = value }
           opts.on("--namespace NAME", "Namespace Kubernetes") { |value| options[:namespace] = value }
           opts.on("--base-image NAME", "Imagem base do Dockerfile") { |value| options[:base_image] = value }
+          opts.on("--agent-runtime MODE", "auto, include ou none para llama-server/modelo GGUF") { |value| options[:agent_runtime] = value }
         end
 
         parser.parse!(argv)
@@ -232,11 +235,40 @@ module Glauco
 
           target = File.join(target_root, entry)
           FileUtils.mkdir_p(File.dirname(target))
-          FileUtils.cp_r(source, target)
+          if entry == "core/framework"
+            copy_framework_runtime(source, target)
+          else
+            FileUtils.cp_r(source, target)
+          end
         end
 
-        stage_llama_server_binary(target_root)
+        stage_agent_runtime(target_root) if include_agent_runtime?
         prune_framework_runtime(target_root)
+      end
+
+      def copy_framework_runtime(source, target)
+        FileUtils.mkdir_p(target)
+
+        Dir.children(source).each do |child|
+          child_source = File.join(source, child)
+          child_target = File.join(target, child)
+
+          if child == "web" && File.directory?(child_source)
+            copy_framework_web_runtime(child_source, child_target)
+          else
+            FileUtils.cp_r(child_source, child_target)
+          end
+        end
+      end
+
+      def copy_framework_web_runtime(source, target)
+        FileUtils.mkdir_p(target)
+
+        Dir.children(source).each do |child|
+          next if child == "node_modules"
+
+          FileUtils.cp_r(File.join(source, child), File.join(target, child))
+        end
       end
 
       def path_for_warbler(path)
@@ -272,22 +304,82 @@ module Glauco
           "@carbon/styles/css"
         )
 
-        Dir.glob(File.join(target_root, "core/framework/models/*.gguf")).each do |model_path|
-          next if File.basename(model_path) == "gemma-4-e4b-it.gguf"
+        FileUtils.rm_rf(File.join(target_root, "core/framework/models")) unless include_agent_runtime?
+      end
 
-          FileUtils.rm_f(model_path)
-        end
+      def stage_agent_runtime(target_root)
+        raise ArgumentError, "llama-server nao encontrado para empacotar. Defina GLAUCO_LLAMASERVER_BIN." unless llama_server_binary_path
+        raise ArgumentError, "Modelo GGUF nao encontrado para empacotar. Defina GLAUCO_LLAMASERVER_MODEL_PATH." unless llama_server_model_path
+
+        stage_llama_server_binary(target_root)
+        stage_llama_server_model(target_root)
       end
 
       def stage_llama_server_binary(target_root)
-        binary = ENV["GLAUCO_LLAMASERVER_BIN"]
-        binary = find_executable("llama-server") if binary.nil? || binary.strip.empty?
-        return unless binary && File.executable?(binary)
+        binary = llama_server_binary_path
+        return unless binary
 
-        target = File.join(target_root, "bin", "llama-server")
+        target = File.join(target_root, "bin", File.basename(binary))
         FileUtils.mkdir_p(File.dirname(target))
         FileUtils.cp(binary, target)
         FileUtils.chmod(0o755, target)
+      end
+
+      def stage_llama_server_model(target_root)
+        model = llama_server_model_path
+        return unless model
+
+        target = File.join(target_root, "core", "framework", "models", File.basename(model))
+        FileUtils.mkdir_p(File.dirname(target))
+        FileUtils.cp(model, target)
+      end
+
+      def include_agent_runtime?
+        return true if agent_runtime == "include"
+        return false if agent_runtime == "none"
+
+        entry_uses_agent? || env_requests_llama_server?
+      end
+
+      def entry_uses_agent?
+        entry = File.join(project_root, entry_path)
+        return false unless File.file?(entry)
+
+        content = File.read(entry, encoding: "UTF-8", invalid: :replace, undef: :replace)
+        content.match?(/GlaucoBasicPlasticAgent|build_agent|bootstrap_agent!|GLAUCO_LLM_PROVIDER|llama-server|ruby_llm/)
+      end
+
+      def env_requests_llama_server?
+        ENV["GLAUCO_LLM_PROVIDER"].to_s == "llama-server" ||
+          present?(ENV["GLAUCO_LLAMASERVER_MODEL_PATH"]) ||
+          present?(ENV["GLAUCO_LLAMASERVER_BIN"])
+      end
+
+      def llama_server_binary_path
+        explicit = ENV["GLAUCO_LLAMASERVER_BIN"]
+        return explicit if present?(explicit) && File.executable?(explicit)
+        return "#{explicit}.exe" if present?(explicit) && File.executable?("#{explicit}.exe")
+
+        find_executable(windows? ? "llama-server.exe" : "llama-server") ||
+          find_executable("llama-server.exe") ||
+          find_executable("llama-server")
+      end
+
+      def llama_server_model_path
+        explicit = ENV["GLAUCO_LLAMASERVER_MODEL_PATH"] || ENV["GLAUCO_LLAMASERVER_LOCAL_MODEL_PATH"]
+        return explicit if present?(explicit) && File.file?(explicit)
+
+        framework_model = Dir.glob(File.join(framework_gem_root, "core", "framework", "models", "*.gguf"))
+          .reject { |path| File.basename(path).downcase.include?("mmproj") }
+          .min_by { |path| File.size(path) }
+        return framework_model if framework_model
+
+        lmstudio_models_root = File.join(Dir.home, ".lmstudio", "models")
+        return nil unless Dir.exist?(lmstudio_models_root)
+
+        Dir.glob(File.join(lmstudio_models_root, "**", "*.gguf"))
+          .reject { |path| File.basename(path).downcase.include?("mmproj") }
+          .min_by { |path| File.size(path) }
       end
 
       def find_executable(name)
@@ -296,6 +388,14 @@ module Glauco
           return candidate if File.executable?(candidate)
         end
         nil
+      end
+
+      def present?(value)
+        value && !value.to_s.strip.empty?
+      end
+
+      def windows?
+        RbConfig::CONFIG["host_os"] =~ /mswin|mingw|cygwin/
       end
 
       def copy_framework_web_asset(source_node_modules, target_node_modules, relative_path)

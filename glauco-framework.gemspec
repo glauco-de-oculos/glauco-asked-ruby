@@ -25,7 +25,7 @@ Gem::Specification.new do |spec|
    .reject { |path| path.start_with?("core/framework/web/node_modules/") }
 
   spec.bindir = "exe"
-  spec.executables = ["glauco-package"]
+  spec.executables = ["glauco-package", "glauco-containerize", "glauco-native-app", "glauco-windows-app"]
   spec.require_paths = ["lib"]
 
   spec.add_dependency "docx", "~> 0.10"

@@ -4,6 +4,7 @@ require "minitest/autorun"
 require "tmpdir"
 require "yaml"
 
+require "glauco/framework/container_pipeline"
 require "glauco/framework/packager"
 
 class PackagerPackageTest < Minitest::Test
@@ -79,6 +80,110 @@ class PackagerPackageTest < Minitest::Test
       assert_includes pod_spec.fetch("volumes"), { "name" => "app-tmp", "emptyDir" => {} }
       assert_includes pod_spec.fetch("volumes"), { "name" => "home", "emptyDir" => {} }
       assert_includes pod_spec.fetch("volumes"), { "name" => "public", "emptyDir" => {} }
+    end
+  end
+
+  def test_container_pipeline_writes_docker_runner_scripts
+    Dir.mktmpdir("glauco-container-pipeline-test") do |project_root|
+      FileUtils.mkdir_p(File.join(project_root, "bin"))
+      File.write(File.join(project_root, "bin", "main.rb"), "puts 'hello from container'\n")
+
+      packager = Glauco::Framework::Packager.new(
+        project_root: project_root,
+        entry_path: "bin/main.rb",
+        app_name: "My Glauco App",
+        output_dir: "dist",
+        image: "my-glauco-app:local",
+        namespace: "apps",
+        base_image: "eclipse-temurin:21-jre"
+      )
+
+      def packager.ensure_build_runtime!; end
+      def packager.build_jar(_warble_config_path)
+        File.write(jar_path, "fake jar")
+      end
+
+      pipeline = Glauco::Framework::ContainerPipeline.new(
+        packager: packager,
+        docker_bin: "docker",
+        container_name: "my-glauco-app",
+        ports: ["8080:8080"],
+        env: ["OLLAMA_HOST=http://ollama:11434"],
+        skip_docker_build: true
+      )
+      pipeline.build
+
+      bat = File.read(File.join(project_root, "dist", "run-my-glauco-app-container.bat"))
+      assert_includes bat, '"docker" "run" "--rm" "--name" "my-glauco-app"'
+      assert_includes bat, '"-e" "GLAUCO_USE_HOST_DISPLAY=0"'
+      assert_includes bat, '"-e" "OLLAMA_HOST=http://ollama:11434"'
+      assert_includes bat, '"-p" "8080:8080"'
+      assert_includes bat, '"my-glauco-app:local"'
+      assert_includes bat, "pause"
+
+      ps1 = File.read(File.join(project_root, "dist", "run-my-glauco-app-container.ps1"))
+      assert_includes ps1, "& 'docker' 'run' '--rm' '--name' 'my-glauco-app'"
+      assert_includes ps1, "'my-glauco-app:local'"
+    end
+  end
+
+  def test_agent_entry_requires_and_stages_llama_runtime
+    Dir.mktmpdir("glauco-agent-packager-test") do |project_root|
+      FileUtils.mkdir_p(File.join(project_root, "bin"))
+      File.write(File.join(project_root, "bin", "main.rb"), "GlaucoBasicPlasticAgent.new\n")
+
+      fake_runtime = File.join(project_root, Gem.win_platform? ? "llama-server.exe" : "llama-server")
+      fake_model = File.join(project_root, "model.gguf")
+      File.write(fake_runtime, "fake runtime")
+      FileUtils.chmod(0o755, fake_runtime)
+      File.write(fake_model, "fake gguf")
+
+      packager = Glauco::Framework::Packager.new(
+        project_root: project_root,
+        entry_path: "bin/main.rb",
+        app_name: "Agent App",
+        output_dir: "dist",
+        image: "agent-app:local",
+        namespace: "apps",
+        base_image: "eclipse-temurin:21-jre"
+      )
+
+      def packager.ensure_build_runtime!; end
+      def packager.build_jar(_warble_config_path)
+        runtime_name = Gem.win_platform? ? "llama-server.exe" : "llama-server"
+        staged_runtime = File.join(project_root, "build", "packaging", slug, "glauco-framework", "bin", runtime_name)
+        staged_model = File.join(project_root, "build", "packaging", slug, "glauco-framework", "core", "framework", "models", "model.gguf")
+
+        raise "runtime not staged" unless File.exist?(staged_runtime)
+        raise "model not staged" unless File.exist?(staged_model)
+
+        File.write(jar_path, "fake jar")
+      end
+
+      with_env(
+        "GLAUCO_LLAMASERVER_BIN" => fake_runtime,
+        "GLAUCO_LLAMASERVER_MODEL_PATH" => fake_model
+      ) do
+        packager.build(write_container_files: false)
+      end
+
+      assert_path_exists File.join(project_root, "dist", "agent-app.jar")
+    end
+  end
+
+  private
+
+  def with_env(values)
+    previous = values.to_h { |key, _| [key, ENV[key]] }
+    values.each { |key, value| ENV[key] = value }
+    yield
+  ensure
+    previous.each do |key, value|
+      if value.nil?
+        ENV.delete(key)
+      else
+        ENV[key] = value
+      end
     end
   end
 end

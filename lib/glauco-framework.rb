@@ -1,5 +1,6 @@
 require "bundler" rescue nil
 require "fileutils"
+require "rbconfig"
 require "tmpdir"
 require_relative "glauco/framework/version"
 
@@ -50,11 +51,11 @@ module Glauco
     def ensure_packaged_llama_server!
       return unless blank?(ENV["GLAUCO_LLAMASERVER_BIN"])
 
-      source = File.join(GEM_ROOT, "bin", "llama-server")
+      source = packaged_llama_server_source
       return unless File.exist?(source)
 
       target_dir = File.join(Dir.tmpdir, "glauco-framework-runtime")
-      target = File.join(target_dir, "llama-server")
+      target = File.join(target_dir, File.basename(source))
       FileUtils.mkdir_p(target_dir)
 
       if !File.exist?(target) || File.size(target) != File.size(source)
@@ -65,6 +66,26 @@ module Glauco
       ENV["GLAUCO_LLAMASERVER_BIN"] = target
     rescue StandardError => e
       warn "[Glauco::Framework] falha ao preparar llama-server empacotado: #{e.class} - #{e.message}"
+    end
+
+    def ensure_packaged_llama_model!
+      return unless blank?(ENV["GLAUCO_LLAMASERVER_MODEL_PATH"])
+
+      model = Dir.glob(File.join(FRAMEWORK_ROOT, "models", "*.gguf")).find do |path|
+        !File.basename(path).downcase.include?("mmproj")
+      end
+      return unless model
+
+      ENV["GLAUCO_LLAMASERVER_MODEL_PATH"] = model
+    end
+
+    def packaged_llama_server_source
+      names = windows? ? ["llama-server.exe", "llama-server"] : ["llama-server", "llama-server.exe"]
+      names.map { |name| File.join(GEM_ROOT, "bin", name) }.find { |path| File.exist?(path) }
+    end
+
+    def windows?
+      RbConfig::CONFIG["host_os"] =~ /mswin|mingw|cygwin/
     end
 
     def blank?(value)
@@ -82,5 +103,6 @@ NODE_MODULES_DIR = File.join(FRAMEWORK_WEB_DIR, "node_modules") unless defined?(
 
 Glauco::Framework.ensure_public_assets!
 Glauco::Framework.ensure_packaged_llama_server!
+Glauco::Framework.ensure_packaged_llama_model!
 
 require File.join(Glauco::Framework::FRAMEWORK_ROOT, "glauco-framework")

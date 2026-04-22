@@ -18,7 +18,10 @@ metadata:
 data:
   OLLAMA_HOST: "http://ollama.glauco.svc.cluster.local:11434"
   OLLAMA_MODEL: "gemma4:e4b"
-  JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -Dfile.encoding=UTF-8 -Djava.io.tmpdir=/tmp"
+  GLAUCO_USE_HOST_DISPLAY: "0"
+  JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -Dfile.encoding=UTF-8 -Djava.io.tmpdir=/app/tmp -Dorg.eclipse.swt.browser.DefaultType=webkit"
+  SWT_GTK3: "1"
+  DISPLAY: ":99"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -67,8 +70,20 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: app-tmp
+              mountPath: /app/tmp
+            - name: home
+              mountPath: /home/glauco
+            - name: public
+              mountPath: /app/public
       volumes:
         - name: tmp
+          emptyDir: {}
+        - name: app-tmp
+          emptyDir: {}
+        - name: home
+          emptyDir: {}
+        - name: public
           emptyDir: {}
 ---
 apiVersion: networking.k8s.io/v1

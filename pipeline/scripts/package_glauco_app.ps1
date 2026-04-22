@@ -214,6 +214,7 @@ $warblerInputPath = Join-Path $workRoot "input"
 $packageOutputPath = Join-Path $outputRoot "packages"
 $launcherPath = Join-Path $workRoot "launcher.rb"
 $warbleConfigPath = Join-Path $workRoot "warble.dynamic.rb"
+$warbleConfigTargetPath = Join-Path $projectRoot "config\warble.rb"
 
 $javaHome = Get-JavaHome
 $jrubyPath = Resolve-ToolPath -ToolName "jruby" -JavaHome ""
@@ -247,7 +248,7 @@ else {
 }
 
 $warbleConfig = @"
-require_relative "../../../pipeline/packaging/warble/shared"
+require_relative "../pipeline/packaging/warble/shared"
 
 Warbler::Config.new do |config|
   Glauco::Packaging::WarbleShared.apply(
@@ -286,17 +287,24 @@ if (-not $SkipJar) {
         Remove-Item -LiteralPath $generatedJarPath -Force
     }
 
-    $previousWarbleConfig = $env:GLAUCO_WARBLE_CONFIG
+    $warbleConfigBackupPath = $null
     try {
-        $env:GLAUCO_WARBLE_CONFIG = $warbleConfigPath
+        New-Item -ItemType Directory -Path (Split-Path $warbleConfigTargetPath -Parent) -Force | Out-Null
+        if (Test-Path $warbleConfigTargetPath) {
+            $warbleConfigBackupPath = Join-Path ([System.IO.Path]::GetTempPath()) "glauco-warble-$PID-$(Get-Date -Format yyyyMMddHHmmss).rb"
+            Copy-Item -LiteralPath $warbleConfigTargetPath -Destination $warbleConfigBackupPath -Force
+        }
+
+        Copy-Item -LiteralPath $warbleConfigPath -Destination $warbleConfigTargetPath -Force
         Invoke-External -FilePath $jrubyPath -Arguments @("-S", "warble", "executable", "jar") -WorkingDirectory $projectRoot
     }
     finally {
-        if ($null -eq $previousWarbleConfig) {
-            Remove-Item Env:GLAUCO_WARBLE_CONFIG -ErrorAction SilentlyContinue
+        if ($warbleConfigBackupPath -and (Test-Path $warbleConfigBackupPath)) {
+            Copy-Item -LiteralPath $warbleConfigBackupPath -Destination $warbleConfigTargetPath -Force
+            Remove-Item -LiteralPath $warbleConfigBackupPath -Force
         }
         else {
-            $env:GLAUCO_WARBLE_CONFIG = $previousWarbleConfig
+            Remove-Item -LiteralPath $warbleConfigTargetPath -ErrorAction SilentlyContinue
         }
     }
 

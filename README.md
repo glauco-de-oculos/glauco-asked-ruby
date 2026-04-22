@@ -99,3 +99,41 @@ O `jar` e o `Dockerfile` sao gerados a partir do ambiente Ruby do proprio projet
 - o projeto consumidor define a versao de JRuby;
 - o projeto consumidor declara `warbler` no `Gemfile`;
 - o container final embala a aplicacao inteira como sandbox de execucao.
+
+Para gerar tudo em um passo, incluindo a imagem Docker local e scripts de duplo clique para subir o container:
+
+```bash
+bundle exec glauco-containerize build --entry bin/main.rb --app-name meu-app --output dist --image meu-app:local --namespace apps
+```
+
+Esse comando gera:
+
+- `dist/meu-app.jar`
+- `dist/Dockerfile`
+- `dist/kubernetes.yaml`
+- imagem Docker `meu-app:local`
+- `dist/run-meu-app-container.bat`
+- `dist/run-meu-app-container.ps1`
+
+Para um app nativo clicavel, com acesso normal ao sistema local onde foi gerado:
+
+```bash
+bundle exec glauco-native-app build --entry bin/main.rb --app-name meu-app --output dist
+```
+
+No Windows, esse comando gera `dist/packages/meu-app/meu-app.exe`,
+`dist/run-meu-app.bat`, `dist/run-meu-app.ps1` e
+`dist/create-meu-app-desktop-shortcut.ps1`. No Linux, gera um app-image
+nativo, `dist/run-meu-app.sh` e `dist/meu-app.desktop`.
+
+Quando a entrada usa o modulo de agente/LLM, o empacotador inclui
+`llama-server` e um modelo `.gguf` no runtime do app. O modo padrao e
+`--agent-runtime auto`; para exigir explicitamente esses artefatos:
+
+```bash
+GLAUCO_LLAMASERVER_BIN=/caminho/llama-server \
+GLAUCO_LLAMASERVER_MODEL_PATH=/caminho/modelo.gguf \
+bundle exec glauco-native-app build --entry bin/main.rb --app-name meu-app --output dist --agent-runtime include
+```
+
+Use `--agent-runtime none` apenas para apps que dependem de um provedor externo.

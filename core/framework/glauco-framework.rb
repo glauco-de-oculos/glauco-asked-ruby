@@ -16,8 +16,10 @@ require 'ruby_llm'
 require 'shellwords'
 require 'timeout'
 require 'uri'
-swt_jar = Gem.win_platform? ? "swt-win32.jar" : "swt.jar"
-require File.join(JARLIBS_DIR, swt_jar)
+swt_candidates = Gem.win_platform? ? ["swt-win32.jar", "swt.jar"] : ["swt.gtk.linux.x86_64_3.131.0.v20250820-1556.jar", "swt.jar"]
+swt_jar = swt_candidates.map { |candidate| File.join(JARLIBS_DIR, candidate) }.find { |candidate| File.exist?(candidate) }
+raise LoadError, "SWT jar nao encontrado em #{JARLIBS_DIR}" unless swt_jar
+require swt_jar
 
 java_import 'org.eclipse.swt.widgets.Display'
 java_import 'org.eclipse.swt.widgets.Shell'
@@ -479,7 +481,6 @@ class GlaucoBasicPlasticAgent
   end
 
   def initialize_llama_server!
-    ensure_lms_installed!
     ensure_llama_server_binary!
     ensure_llama_server_model_downloaded!
     restart_llama_server! if llama_server_running? && !llama_server_matches_target?
@@ -497,7 +498,7 @@ class GlaucoBasicPlasticAgent
   end
 
   def ensure_llama_server_binary!
-    return if command_available?(LLAMA_SERVER_BIN)
+    return if executable_available?(LLAMA_SERVER_BIN)
 
     raise "llama-server não encontrado. Defina GLAUCO_LLAMASERVER_BIN ou instale llama.cpp com o binário llama-server."
   end
@@ -509,6 +510,7 @@ class GlaucoBasicPlasticAgent
     model_key = presence(@llama_server_model_key)
     raise "Defina GLAUCO_LLAMASERVER_MODEL_KEY para baixar um modelo GGUF via LM Studio." unless model_key
 
+    ensure_lms_installed!
     download_llama_server_model!(model_key)
     sync_framework_model_from_download!
     return if resolved_llama_server_model_path
@@ -538,7 +540,7 @@ class GlaucoBasicPlasticAgent
     pid = spawn(
       args.first,
       *args.drop(1),
-      in: "/dev/null",
+      in: null_device,
       out: LLAMA_SERVER_LOG,
       err: LLAMA_SERVER_LOG,
       pgroup: true
@@ -586,7 +588,11 @@ class GlaucoBasicPlasticAgent
   end
 
   def restart_llama_server!
-    system("pkill", "-f", "#{LLAMA_SERVER_BIN} --model")
+    if Gem.win_platform?
+      system("taskkill", "/F", "/IM", File.basename(LLAMA_SERVER_BIN), out: File::NULL, err: File::NULL)
+    else
+      system("pkill", "-f", "#{LLAMA_SERVER_BIN} --model")
+    end
     wait_until!("llama-server antigo não encerrou.", timeout: 10) do
       !llama_server_running?
     end
@@ -636,7 +642,25 @@ class GlaucoBasicPlasticAgent
   end
 
   def command_available?(name)
-    system({ "PATH" => [LMS_BIN_DIR, ENV["PATH"]].compact.join(":") }, "bash", "-lc", "command -v #{Shellwords.escape(name)} >/dev/null 2>&1")
+    path = [LMS_BIN_DIR, ENV["PATH"]].compact.join(File::PATH_SEPARATOR)
+    if Gem.win_platform?
+      ENV.fetch("PATH", "").split(File::PATH_SEPARATOR).any? do |dir|
+        File.executable?(File.join(dir, name)) || File.executable?(File.join(dir, "#{name}.exe"))
+      end || File.executable?(File.join(LMS_BIN_DIR, name)) || File.executable?(File.join(LMS_BIN_DIR, "#{name}.exe"))
+    else
+      system({ "PATH" => path }, "sh", "-lc", "command -v #{Shellwords.escape(name)} >/dev/null 2>&1")
+    end
+  end
+
+  def executable_available?(name)
+    return true if name && File.executable?(name)
+    return true if name && Gem.win_platform? && File.executable?("#{name}.exe")
+
+    command_available?(name)
+  end
+
+  def null_device
+    Gem.win_platform? ? "NUL" : "/dev/null"
   end
 
   def wait_until!(message, timeout:)
@@ -1382,7 +1406,7 @@ class GlaucoAgentBrowserEnv < GlaucoBasicPlasticAgent
 end
 
 module Frontend
-  DEBUG = true
+  DEBUG = ENV.fetch("GLAUCO_DEBUG", "0") == "1"
   DEFAULT_PORT = (ENV["GLAUCO_PORT"] || "8000").to_i
   @overlay_registry = {}
   @embedded_browser_registry = {}
@@ -1598,6 +1622,7 @@ module Frontend
   )
 
   @server = server
+  @root_html = +""
 
   def self.server_port
     @server_port
@@ -1611,7 +1636,44 @@ module Frontend
     "http://localhost:#{@server_port}"
   end
 
+  def self.root_url
+    "#{base_url}/__glauco/root"
+  end
+
+  def self.root_html=(html)
+    @root_html = html.to_s
+  end
+
+  def self.root_html
+    @root_html.to_s
+  end
+
+  def self.wait_for_server!(timeout: 5)
+    deadline = Time.now + timeout
+    loop do
+      begin
+        Net::HTTP.start("127.0.0.1", @server_port, open_timeout: 0.2, read_timeout: 0.2) do |http|
+          http.get("/__glauco/ping")
+        end
+        return true
+      rescue StandardError
+        raise "Servidor frontend nao iniciou em #{base_url}" if Time.now >= deadline
+        sleep 0.05
+      end
+    end
+  end
+
   server.mount('/node_modules', WEBrick::HTTPServlet::FileHandler, node_modules)
+
+  server.mount_proc '/__glauco/ping' do |_req, res|
+    res['Content-Type'] = 'text/plain'
+    res.body = 'ok'
+  end
+
+  server.mount_proc '/__glauco/root' do |_req, res|
+    res['Content-Type'] = 'text/html; charset=UTF-8'
+    res.body = Frontend.root_html
+  end
 
   require 'uri'
 
@@ -1898,7 +1960,7 @@ module CarbonRegistry
   require 'json'
   require 'set'
 
-  DEBUG = true
+  DEBUG = ENV.fetch("GLAUCO_CARBON_DEBUG", ENV.fetch("GLAUCO_DEBUG", "0")) == "1"
 
   def self.log(msg)
     puts "[CarbonRegistry] #{msg}" if DEBUG
@@ -2140,7 +2202,9 @@ end
         </html>
       HTML
 
-      @browser.setText(html)
+      Frontend.root_html = html
+      Frontend.wait_for_server!
+      @browser.setUrl(Frontend.root_url)
     end
   end
 
@@ -2736,6 +2800,7 @@ end
     $surface_parent.addListener(SWT::Resize, frontend_resize_listener)
 
     @server_thread ||= Thread.new { server.start }
+    wait_for_server!
   end
 
   def self.start!

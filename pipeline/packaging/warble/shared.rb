@@ -1,4 +1,4 @@
-require "glauco/framework/warble_shared"
+require_relative "../../../lib/glauco/framework/warble_shared"
 
 module Glauco
   module Packaging
