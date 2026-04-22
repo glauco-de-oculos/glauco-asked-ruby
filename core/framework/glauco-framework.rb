@@ -2659,6 +2659,14 @@ end
       tag("embedded-browser", host_content, **embedded_attrs)
     end
 
+    def agent_chatbox(**attrs, &block)
+      component = AgentChatboxComponent.new(parent_renderer: @parent_renderer, **attrs, &block)
+      add_child(component)
+      html = component.render_to_html
+      append_captured_node(html)
+      html
+    end
+
     def render_nodes(result)
       components = result.is_a?(Array) ? result : [result]
 
@@ -2715,6 +2723,266 @@ end
     def rerender
       puts "rerenderrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
       @parent_renderer.render
+    end
+  end
+
+  class AgentChatboxComponent < Component
+    def initialize(
+      parent_renderer:,
+      id: "agent-chatbox",
+      title: "Agente",
+      subtitle: nil,
+      placeholder: "Digite uma mensagem...",
+      initial_messages: [],
+      quick_prompts: [],
+      user_author: "Voce",
+      response_author: "Agente",
+      on_input: nil,
+      output_handler: nil,
+      on_response: nil,
+      **attrs,
+      &block
+    )
+      super(parent_renderer: parent_renderer, **attrs)
+
+      @id = id.to_s
+      @title = title
+      @subtitle = subtitle
+      @placeholder = placeholder
+      @quick_prompts = Array(quick_prompts)
+      @user_author = user_author
+      @response_author = response_author
+      @on_input = on_input
+      @output_handler = output_handler
+      @on_response = on_response
+      @children_block = block
+
+      @state[:draft] = ""
+      @state[:typing] = false
+      @state[:messages] = normalize_initial_messages(initial_messages)
+      @state[:feed] = { messages: @state[:messages], typing: false }
+      @state[:outputs] = @state[:feed]
+
+      ui do
+        section(class: "agent-chatbox flex min-h-0 flex-col border border-[#d0d0d0] bg-white #{attrs[:class]}".strip, id: @id) do
+          render_header +
+            render_children +
+            render_messages +
+            render_quick_prompts +
+            render_composer
+        end
+      end
+    end
+
+    def push_message(prompt)
+      text = prompt.to_s.strip
+      return nil if text.empty?
+
+      dispatch_user_message(text)
+      nil
+    end
+
+    private
+
+    def normalize_initial_messages(messages)
+      Array(messages).map do |message|
+        {
+          role: message[:role] || :assistant,
+          author: message[:author] || @response_author,
+          text: message[:text].to_s,
+          time: message[:time] || "agora"
+        }
+      end
+    end
+
+    def render_header
+      div(class: "border-b border-[#d0d0d0] p-4") do
+        div(@title, class: "text-xs font-semibold uppercase tracking-[0.24em] text-[#525252]") +
+          if @subtitle.to_s.empty?
+            ""
+          else
+            p(@subtitle, class: "mt-2 text-sm leading-6 text-[#525252]")
+          end
+      end
+    end
+
+    def render_children
+      return "" unless @children_block
+
+      bind(:outputs, div(class: "border-b border-[#e0e0e0] p-4")) do |outputs|
+        if @children_block.arity.zero?
+          instance_eval(&@children_block)
+        else
+          instance_exec(input_handler, outputs, &@children_block)
+        end
+      end
+    end
+
+    def render_messages
+      bind(:feed, div(id: messages_id, class: "min-h-0 flex-1 space-y-3 overflow-y-auto p-4")) do |feed|
+        items = Array(feed[:messages]).map { |message| message_bubble(message) }
+        items << typing_indicator if feed[:typing]
+        items
+      end
+    end
+
+    def render_quick_prompts
+      return "" if @quick_prompts.empty?
+
+      div(class: "border-t border-[#e0e0e0] p-4") do
+        div("Sugestoes", class: "mb-3 text-xs font-semibold uppercase tracking-[0.2em] text-[#525252]") +
+          div(class: "flex flex-wrap gap-2") do
+            @quick_prompts.map do |prompt|
+              button(kind: "ghost", onclick: proc { dispatch_user_message(prompt) }) { prompt }
+            end
+          end
+      end
+    end
+
+    def render_composer
+      div(class: "border-t border-[#d0d0d0] p-4") do
+        textarea(
+          "",
+          id: draft_id,
+          rows: "4",
+          placeholder: @placeholder,
+          oninput: proc { |value| set_state(:draft, value.to_s, replace: true) },
+          class: "w-full resize-none border border-[#8d8d8d] bg-white p-3 text-sm leading-6 outline-none focus:border-[#0f62fe]"
+        ) +
+          div(class: "mt-3 flex items-center justify-between gap-3") do
+            bind(:typing, span(class: "text-xs text-[#525252]")) do |typing|
+              typing ? "Consultando backend..." : "Pronto para enviar"
+            end +
+              button(kind: "primary", onclick: proc { submit_message }) { "Enviar" }
+          end
+      end
+    end
+
+    def message_bubble(message)
+      from_user = message[:role] == :user
+      wrapper = from_user ? "flex justify-end" : "flex justify-start"
+      bubble = from_user ? "bg-[#0f62fe] text-white" : "bg-[#f4f4f4] text-[#262626]"
+      meta = from_user ? "text-blue-100" : "text-[#525252]"
+
+      div(class: wrapper) do
+        div(class: "max-w-[88%] #{bubble} px-4 py-3") do
+          div(message[:author], class: "text-[11px] font-semibold uppercase tracking-[0.18em] #{meta}") +
+            div(message[:text], class: "mt-2 whitespace-pre-wrap text-sm leading-6") +
+            div(message[:time], class: "mt-2 text-[11px] #{meta}")
+        end
+      end
+    end
+
+    def typing_indicator
+      div(class: "flex justify-start") do
+        div("#{@response_author} esta respondendo...", class: "bg-[#f4f4f4] px-4 py-3 text-sm text-[#525252]")
+      end
+    end
+
+    def submit_message
+      dispatch_user_message(@state[:draft])
+    end
+
+    def input_handler
+      proc { |message| dispatch_user_message(message) }
+    end
+
+    def dispatch_user_message(prompt)
+      text = prompt.to_s.strip
+      return nil if text.empty?
+
+      call_handler(@on_input, text) if @on_input
+
+      messages = Array(@state[:messages]) + [
+        { role: :user, author: @user_author, text: text, time: current_time }
+      ]
+
+      batch do
+        set_state(:messages, messages, replace: true)
+        set_state(:feed, { messages: messages, typing: true }, replace: true)
+        set_state(:outputs, { messages: messages, typing: true }, replace: true)
+        set_state(:draft, "", replace: true)
+        set_state(:typing, true)
+      end
+
+      clear_input
+      scroll_to_bottom
+
+      Thread.new do
+        response = generate_response(text)
+
+        async do
+          append_response(response)
+        end
+      end
+
+      nil
+    end
+
+    def generate_response(prompt)
+      return "Nenhum output_handler foi configurado para este agent_chatbox." unless @output_handler
+
+      call_handler(@output_handler, prompt).to_s
+    rescue => e
+      "Erro ao gerar resposta: #{e.class} - #{e.message}"
+    end
+
+    def append_response(response)
+      call_handler(@on_response, response) if @on_response
+
+      messages = Array(@state[:messages]) + [
+        { role: :assistant, author: @response_author, text: response.to_s, time: current_time }
+      ]
+
+      batch do
+        set_state(:messages, messages, replace: true)
+        set_state(:feed, { messages: messages, typing: false }, replace: true)
+        set_state(:outputs, { messages: messages, typing: false }, replace: true)
+        set_state(:typing, false)
+      end
+
+      scroll_to_bottom
+    end
+
+    def call_handler(handler, value)
+      case handler.arity
+      when 0
+        handler.call
+      when 1
+        handler.call(value)
+      else
+        handler.call(value, self)
+      end
+    end
+
+    def clear_input
+      run_js(<<~JS)
+        (() => {
+          const field = document.getElementById(#{draft_id.to_json});
+          if (field) field.value = '';
+        })();
+      JS
+    end
+
+    def scroll_to_bottom
+      run_js(<<~JS)
+        (() => {
+          const list = document.getElementById(#{messages_id.to_json});
+          if (list) list.scrollTop = list.scrollHeight;
+        })();
+      JS
+    end
+
+    def draft_id
+      "#{@id}-draft"
+    end
+
+    def messages_id
+      "#{@id}-messages"
+    end
+
+    def current_time
+      Time.now.strftime("%H:%M")
     end
   end
 
