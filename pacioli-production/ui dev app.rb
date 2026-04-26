@@ -338,11 +338,13 @@ class AgentBehaviorStudio < Frontend::Component
   end
 end
 
-app = AgentBehaviorStudio.new(parent_renderer: $root)
-$root.root_component = app
-$root.render
+Frontend.ensure_frontend_runtime!
 
 $shell.setText("Pacioli Production - Agent Behavior Studio")
 $shell.setSize(1440, 900)
+
+app = AgentBehaviorStudio.new(parent_renderer: $root)
+$root.root_component = app
+$root.render
 
 Frontend.start!

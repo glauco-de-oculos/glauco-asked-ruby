@@ -16,3 +16,5 @@ core/llamacpp/*.*
 runtime
 floating-chat-app.err.log
 floating-chat-app.out.log
+.glauco_profiles/
+.github/

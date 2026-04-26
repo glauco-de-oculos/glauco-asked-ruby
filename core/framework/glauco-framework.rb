@@ -30,6 +30,7 @@ java_import 'org.eclipse.swt.browser.Browser'
 java_import 'org.eclipse.swt.browser.BrowserFunction'
 java_import "org.eclipse.swt.browser.LocationAdapter"
 java_import 'org.eclipse.swt.widgets.FileDialog'
+java_import 'org.eclipse.swt.program.Program'
 java_import 'org.eclipse.swt.SWT'
 java_import 'java.awt.Toolkit'
 java_import 'java.awt.datatransfer.DataFlavor'
@@ -859,6 +860,38 @@ class GlaucoBasicPlasticAgent
   end
 end
 
+java_import 'java.lang.System'
+java_import 'org.eclipse.swt.widgets.Display'
+
+module GlaucoBrowserProfile
+  APP_NAME = "GlaucoFramework"
+
+  def self.configure!(
+    profile_name: "default",
+    root_dir: File.join(Dir.home, ".glauco", "profiles")
+  )
+    profile_dir = File.expand_path(
+      File.join(root_dir, profile_name, "webview2")
+    )
+
+    FileUtils.mkdir_p(profile_dir)
+
+    Display.setAppName(APP_NAME)
+
+    System.setProperty(
+      "org.eclipse.swt.browser.DefaultType",
+      "edge"
+    )
+
+    System.setProperty(
+      "org.eclipse.swt.browser.EdgeDataDir",
+      profile_dir
+    )
+
+    profile_dir
+  end
+end
+
 class GlaucoAgentBrowserEnv < GlaucoBasicPlasticAgent
   FRAME_LIMITATION_NOTE = "Frames internos via SWT Browser dependem da engine embutida e de same-origin. O schema abaixo prepara introspeccao e avaliacao em frame quando acessivel."
 
@@ -1405,11 +1438,170 @@ class GlaucoAgentBrowserEnv < GlaucoBasicPlasticAgent
   end
 end
 
+module Glauco
+  module Framework
+    class SqlDatabase
+      attr_reader :path
+
+      SQLITE_DRIVER_CLASS = "org.sqlite.JDBC"
+
+      def initialize(path:)
+        @path = File.expand_path(path)
+        @connection = nil
+      end
+
+      def connect
+        return @connection if @connection
+
+        load_sqlite_driver!
+        FileUtils.mkdir_p(File.dirname(path))
+        @connection = Java::JavaSql::DriverManager.getConnection("jdbc:sqlite:#{path}")
+      end
+
+      def execute(sql, params = [])
+        statement = prepare(sql, params)
+        statement.executeUpdate
+      ensure
+        statement&.close
+      end
+
+      def query(sql, params = [])
+        statement = prepare(sql, params)
+        result = statement.executeQuery
+        rows = []
+        metadata = result.getMetaData
+        column_count = metadata.getColumnCount
+
+        while result.next
+          row = {}
+          (1..column_count).each do |index|
+            row[metadata.getColumnLabel(index)] = result.getObject(index)
+          end
+          rows << row
+        end
+
+        rows
+      ensure
+        result&.close
+        statement&.close
+      end
+
+      def migrate!(statements)
+        Array(statements).each { |statement| execute(statement) }
+        true
+      end
+
+      def close
+        @connection&.close
+        @connection = nil
+      end
+
+      private
+
+      def prepare(sql, params)
+        statement = connect.prepareStatement(sql.to_s)
+        Array(params).each_with_index do |value, index|
+          statement.setObject(index + 1, value)
+        end
+        statement
+      end
+
+      def load_sqlite_driver!
+        begin
+          require "jdbc/sqlite3"
+        rescue LoadError
+          nil
+        end
+        require_sqlite_jars
+        Java::JavaLang::Class.forName(SQLITE_DRIVER_CLASS)
+      rescue Java::JavaLang::ClassNotFoundException
+        raise LoadError, "Driver SQLite JDBC nao encontrado. Adicione sqlite-jdbc*.jar em jarlibs/ ou a gem jdbc-sqlite3."
+      end
+
+      def require_sqlite_jars
+        roots = [
+          defined?(PROJECT_ROOT) ? File.join(PROJECT_ROOT, "jarlibs") : nil,
+          defined?(JARLIBS_DIR) ? JARLIBS_DIR : nil
+        ].compact.uniq
+
+        roots.each do |root|
+          next unless Dir.exist?(root)
+
+          Dir.glob(File.join(root, "sqlite-jdbc*.jar")).each { |jar| require jar }
+        end
+      end
+    end
+
+    class SqlAgentRuntime
+      attr_reader :database
+
+      def initialize(database_path:, schema: [], seed: nil)
+        @database = SqlDatabase.new(path: database_path)
+        @schema = Array(schema)
+        @seed = seed
+      end
+
+      def db_init(*)
+        database.migrate!(@schema)
+        db_seed_company(@seed) if @seed
+        "database initialized at #{database.path}"
+      end
+
+      def db_maintain(statements)
+        database.migrate!(Array(statements))
+        "database maintenance applied"
+      end
+
+      def db_execute(sql, params = [])
+        database.execute(sql, params)
+      end
+
+      def db_query(sql, params = [])
+        database.query(sql, params)
+      end
+
+      def db_seed_company(company)
+        return "no company data" unless company
+
+        database.execute(
+          "INSERT OR REPLACE INTO companies (id, name, cnpj, city, state) VALUES (?, ?, ?, ?, ?)",
+          [company[:id], company[:name], company[:cnpj], company[:city], company[:state]]
+        )
+        Array(company[:documents]).each do |document|
+          database.execute(
+            "INSERT OR REPLACE INTO documents (id, company_id, name, kind, status, confidence) VALUES (?, ?, ?, ?, ?, ?)",
+            [document[:id], company[:id], document[:name], document[:kind], document[:status], document[:confidence]]
+          )
+        end
+        Array(company[:criteria]).each do |criterion|
+          database.execute(
+            "INSERT OR REPLACE INTO criteria (id, company_id, title, status, risk) VALUES (?, ?, ?, ?, ?)",
+            [criterion[:id], company[:id], criterion[:title], criterion[:status], criterion[:risk]]
+          )
+        end
+
+        "company data seeded"
+      end
+
+      def db_company_snapshot(company_id)
+        {
+          company: database.query("SELECT * FROM companies WHERE id = ?", [company_id]).first,
+          documents: database.query("SELECT * FROM documents WHERE company_id = ? ORDER BY name", [company_id]),
+          criteria: database.query("SELECT * FROM criteria WHERE company_id = ? ORDER BY title", [company_id])
+        }
+      end
+    end
+  end
+end
+
 module Frontend
   DEBUG = ENV.fetch("GLAUCO_DEBUG", "0") == "1"
   DEFAULT_PORT = (ENV["GLAUCO_PORT"] || "8000").to_i
   @overlay_registry = {}
   @embedded_browser_registry = {}
+  @served_page_registry = {}
+  @served_page_servers = {}
+  @ngrok_tunnels = {}
 
   def debug_log(msg)
     puts "[DEBUG] #{msg}" if DEBUG
@@ -1423,12 +1615,224 @@ module Frontend
     @embedded_browser_registry ||= {}
   end
 
+  def self.served_page_registry
+    @served_page_registry ||= {}
+  end
+
+  def self.served_page_servers
+    @served_page_servers ||= {}
+  end
+
+  def self.ngrok_tunnels
+    @ngrok_tunnels ||= {}
+  end
+
   def self.register_overlay_page(id, config)
     overlay_registry[id.to_s] = config
   end
 
   def self.register_embedded_browser(id, config)
     embedded_browser_registry[id.to_s] = config
+  end
+
+  def self.register_served_page(id, config)
+    normalized = config.merge(id: id.to_s)
+    normalized[:port] = ensure_served_page_server!(normalized[:port]) if normalized[:port]
+    served_page_registry[id.to_s] = normalized
+  end
+
+  def self.unregister_served_page(id)
+    served_page_registry.delete(id.to_s)
+  end
+
+  def self.served_page_url(id)
+    page = served_page_registry[id.to_s]
+    port = page && page[:port] ? page[:port].to_i : @server_port
+    "http://localhost:#{port}/__glauco/pages/#{URI.encode_www_form_component(id.to_s)}"
+  end
+
+  def self.ensure_served_page_server!(preferred_port)
+    requested_port = preferred_port.to_i
+    return @server_port if requested_port == @server_port
+    return served_page_servers[requested_port][:port] if served_page_servers[requested_port]
+
+    actual_port = resolve_server_port(requested_port)
+    server = WEBrick::HTTPServer.new(
+      Port: actual_port,
+      DocumentRoot: PUBLIC_DIR,
+      AccessLog: [],
+      Logger: WEBrick::Log.new(nil, 0)
+    )
+    mount_served_page_routes(server)
+    thread = Thread.new { server.start }
+    served_page_servers[requested_port] = { port: actual_port, server: server, thread: thread }
+    actual_port
+  end
+
+  def self.mount_served_page_routes(server)
+    server.mount_proc '/__glauco/ping' do |_req, res|
+      res['Content-Type'] = 'text/plain'
+      res.body = 'ok'
+    end
+
+    server.mount_proc '/__glauco/pages' do |req, res|
+      id = req.path.sub(%r{\A/__glauco/pages/?}, "")
+      id = URI.decode_www_form_component(id.to_s)
+      page = Frontend.served_page_registry[id]
+
+      if page
+        res['Content-Type'] = 'text/html; charset=UTF-8'
+        res.body = page[:html].to_s
+      else
+        res.status = 404
+        res.body = "Served page not found: #{id}"
+      end
+    end
+  end
+
+  def self.start_ngrok_tunnel(id, port: server_port, ngrok_bin: ENV.fetch("NGROK_BIN", "ngrok"), authtoken: ENV["NGROK_AUTHTOKEN"])
+    id = id.to_s
+    return ngrok_tunnels[id] if ngrok_tunnels[id]&.dig(:public_url)
+
+    system(ngrok_bin, "config", "add-authtoken", authtoken, out: File::NULL, err: File::NULL) if authtoken && !authtoken.to_s.empty?
+    pid = Process.spawn(ngrok_bin, "http", port.to_s, out: File::NULL, err: File::NULL)
+
+    public_url = wait_for_ngrok_public_url
+    ngrok_tunnels[id] = { pid: pid, port: port, public_url: public_url }
+  rescue Errno::ENOENT
+    raise "ngrok nao encontrado. Instale ngrok ou defina NGROK_BIN."
+  end
+
+  def self.stop_ngrok_tunnel(id)
+    tunnel = ngrok_tunnels.delete(id.to_s)
+    return false unless tunnel && tunnel[:pid]
+
+    begin
+      Process.kill("TERM", tunnel[:pid])
+    rescue StandardError
+      begin
+        Process.kill("KILL", tunnel[:pid])
+      rescue StandardError
+        nil
+      end
+    end
+    true
+  end
+
+  def self.wait_for_ngrok_public_url(timeout: 15)
+    deadline = Time.now + timeout
+    uri = URI("http://127.0.0.1:4040/api/tunnels")
+
+    loop do
+      begin
+        response = Net::HTTP.get_response(uri)
+        data = JSON.parse(response.body)
+        tunnel = Array(data["tunnels"]).find { |item| item["public_url"].to_s.start_with?("https://") } ||
+                 Array(data["tunnels"]).first
+        return tunnel["public_url"] if tunnel && tunnel["public_url"]
+      rescue StandardError
+      end
+
+      raise "ngrok iniciou, mas nao publicou URL em http://127.0.0.1:4040/api/tunnels" if Time.now >= deadline
+      sleep 0.3
+    end
+  end
+
+  def self.generate_twa_artifacts_for(id, output_dir: File.join(PROJECT_ROOT, "dist", "twa"), public_url: nil, package_name: nil, app_name: nil)
+    config = served_page_registry[id.to_s] || {}
+    public_url ||= ngrok_tunnels.dig(id.to_s, :public_url) || served_page_url(id)
+    uri = URI(public_url)
+    app_name ||= config[:title] || id.to_s
+    package_name ||= config.dig(:twa, :package_name) || "app.glauco.#{id.to_s.gsub(/[^a-zA-Z0-9_]/, "_").downcase}"
+    target = File.join(output_dir, id.to_s)
+
+    FileUtils.mkdir_p(target)
+    File.write(File.join(target, "twa-manifest.json"), JSON.pretty_generate(
+      packageId: package_name,
+      host: uri.host,
+      name: app_name,
+      launcherName: app_name,
+      startUrl: uri.request_uri.empty? ? "/" : uri.request_uri,
+      display: "standalone",
+      themeColor: "#0f62fe",
+      navigationColor: "#0f62fe",
+      signingKey: { path: "android.keystore", alias: "android" }
+    ))
+    File.write(File.join(target, "assetlinks.json"), JSON.pretty_generate([
+      {
+        relation: ["delegate_permission/common.handle_all_urls"],
+        target: {
+          namespace: "android_app",
+          package_name: package_name,
+          sha256_cert_fingerprints: Array(config.dig(:twa, :sha256_cert_fingerprints))
+        }
+      }
+    ]))
+    File.write(File.join(target, "build-twa.ps1"), <<~PS1)
+      Set-StrictMode -Version Latest
+      $ErrorActionPreference = "Stop"
+      Set-Location $PSScriptRoot
+      bubblewrap init --manifest twa-manifest.json
+      bubblewrap build
+    PS1
+    sh_path = File.join(target, "build-twa.sh")
+    File.write(sh_path, <<~SH)
+      #!/usr/bin/env sh
+      set -eu
+      cd "$(dirname "$0")"
+      bubblewrap init --manifest twa-manifest.json
+      bubblewrap build
+    SH
+    File.chmod(0o755, sh_path) rescue nil
+    target
+  end
+
+  def self.build_signed_twa_apk_for(
+    id,
+    output_dir: File.join(PROJECT_ROOT, "dist", "twa"),
+    public_url: nil,
+    package_name: nil,
+    app_name: nil,
+    bubblewrap_bin: ENV.fetch("BUBBLEWRAP_BIN", "bubblewrap")
+  )
+    target = generate_twa_artifacts_for(
+      id,
+      output_dir: output_dir,
+      public_url: public_url,
+      package_name: package_name,
+      app_name: app_name
+    )
+    ensure_twa_build_requirements!(bubblewrap_bin: bubblewrap_bin)
+
+    Dir.chdir(target) do
+      run_twa_command!(bubblewrap_bin, "init", "--manifest", "twa-manifest.json") unless File.exist?(File.join(target, "package.json"))
+      run_twa_command!(bubblewrap_bin, "build")
+    end
+
+    {
+      directory: target,
+      apk: Dir.glob(File.join(target, "**", "*.apk")).max_by { |path| File.mtime(path).to_f },
+      aab: Dir.glob(File.join(target, "**", "*.aab")).max_by { |path| File.mtime(path).to_f }
+    }
+  end
+
+  def self.ensure_twa_build_requirements!(bubblewrap_bin: ENV.fetch("BUBBLEWRAP_BIN", "bubblewrap"))
+    raise "bubblewrap nao encontrado. Instale com npm install -g @bubblewrap/cli ou defina BUBBLEWRAP_BIN." unless command_available?(bubblewrap_bin)
+    raise "ANDROID_HOME ou ANDROID_SDK_ROOT nao definido. Instale Android SDK Command-line Tools e exporte o caminho." if ENV["ANDROID_HOME"].to_s.empty? && ENV["ANDROID_SDK_ROOT"].to_s.empty?
+    raise "JAVA_HOME nao definido. Configure JDK compativel com Android/Gradle." if ENV["JAVA_HOME"].to_s.empty?
+
+    true
+  end
+
+  def self.command_available?(command)
+    system(command, "--version", out: File::NULL, err: File::NULL)
+  rescue Errno::ENOENT
+    false
+  end
+
+  def self.run_twa_command!(*command)
+    ok = system(*command)
+    raise "Falha ao executar #{command.join(' ')}" unless ok
   end
 
   def self.register_overlay_geometry_callback(browser, element_id)
@@ -1448,7 +1852,8 @@ module Frontend
   end
 
   def self.register_embedded_browser_geometry_callback(browser, element_id)
-    callback_name = "embedded_geom_#{element_id}_#{rand(1000..9999)}"
+    safe_id = element_id.to_s.gsub(/[^A-Za-z0-9_$]/, "_")
+    callback_name = "embedded_geom_#{safe_id}_#{rand(1000..9999)}"
 
     $callbacks[callback_name] = proc do |payload|
       begin
@@ -1673,6 +2078,20 @@ module Frontend
   server.mount_proc '/__glauco/root' do |_req, res|
     res['Content-Type'] = 'text/html; charset=UTF-8'
     res.body = Frontend.root_html
+  end
+
+  server.mount_proc '/__glauco/pages' do |req, res|
+    id = req.path.sub(%r{\A/__glauco/pages/?}, "")
+    id = URI.decode_www_form_component(id.to_s)
+    page = Frontend.served_page_registry[id]
+
+    if page
+      res['Content-Type'] = 'text/html; charset=UTF-8'
+      res.body = page[:html].to_s
+    else
+      res.status = 404
+      res.body = "Served page not found: #{id}"
+    end
   end
 
   require 'uri'
@@ -1928,6 +2347,87 @@ module Frontend
 
     true
   end
+
+  def self.embedded_browser_surface(element_id)
+  return nil unless defined?($embedded_surfaces) && $embedded_surfaces
+
+  surface = $embedded_surfaces[element_id.to_s]
+  return nil unless surface
+  return nil if surface.isDisposed
+
+  surface
+end
+
+def self.with_embedded_browser_surface(element_id)
+  surface = embedded_browser_surface(element_id)
+
+  unless surface
+    show_embedded_browser(element_id)
+    surface = embedded_browser_surface(element_id)
+  end
+
+  raise "embedded browser não encontrado ou não inicializado: #{element_id}" unless surface
+  raise "display não inicializado" unless defined?($display) && $display && !$display.isDisposed
+
+  if $display.getThread == java.lang.Thread.currentThread
+    yield surface
+  else
+    result = nil
+    error = nil
+
+    $display.sync_exec do
+      begin
+        result = yield surface
+      rescue => e
+        error = e
+      end
+    end
+
+    raise error if error
+    result
+  end
+end
+
+def self.execute_embedded_browser_js(element_id, js_code)
+  with_embedded_browser_surface(element_id) do |surface|
+    surface.execute(js_code.to_s)
+  end
+end
+
+def self.evaluate_embedded_browser_js(element_id, js_code)
+  with_embedded_browser_surface(element_id) do |surface|
+    surface.evaluate(js_code.to_s)
+  end
+end
+
+def self.async_execute_embedded_browser_js(element_id, js_code)
+  raise "display não inicializado" unless defined?($display) && $display && !$display.isDisposed
+
+  $display.async_exec do
+    begin
+      execute_embedded_browser_js(element_id, js_code)
+    rescue => e
+      puts "[EmbeddedBrowser JS] #{e.class}: #{e.message}"
+    end
+  end
+
+  nil
+end
+
+def self.async_evaluate_embedded_browser_js(element_id, js_code, &block)
+  raise "display não inicializado" unless defined?($display) && $display && !$display.isDisposed
+
+  $display.async_exec do
+    begin
+      result = evaluate_embedded_browser_js(element_id, js_code)
+      block.call(result) if block
+    rescue => e
+      puts "[EmbeddedBrowser JS] #{e.class}: #{e.message}"
+    end
+  end
+
+  nil
+end
 
   def self.sync_embedded_browser_surfaces
     embedded_browser_registry.keys.each do |element_id|
@@ -2218,6 +2718,8 @@ end
       puts "initilizing component" if DEBUG
       @state = {}
       @bindings = {}
+      @bindings_by_path = Hash.new { |hash, key| hash[key] = [] }
+      @binding_sequence = 0
       @effects = []
       @effect_sequence = 0
       @pending_effect_ids = Set.new
@@ -2308,14 +2810,17 @@ end
     def bind(state_key, node, &block)
       state_path = state_key.is_a?(StatePath) ? state_key : StatePath.new(state_key)
       path_str = state_path.to_s
+      @binding_sequence += 1
+      binding_id = "binding_#{@binding_sequence}"
 
       node_html = node.to_s
       node_html = node_html.sub(
         /<([a-zA-Z0-9\-_]+)([^>]*)>/,
-        '<\1\2 data-bind="' + path_str + '">'
+        '<\1\2 data-bind="' + path_str + '" data-bind-id="' + binding_id + '">'
       )
 
-      @bindings[path_str] = { path: state_path, key: path_str, block: block }
+      @bindings[binding_id] = { id: binding_id, path: state_path, key: path_str, block: block }
+      @bindings_by_path[path_str] << binding_id
 
       value = dig_state_path(state_path)
 
@@ -2419,31 +2924,36 @@ end
       path_str = normalize_state_path(path)
       puts "notify_bindings called for path #{path_str}" if DEBUG
 
-      binding = @bindings[path_str]
+      binding_ids = @bindings_by_path[path_str]
+      return path_str if binding_ids.nil? || binding_ids.empty?
 
-      puts binding.inspect
+      updates = binding_ids.filter_map do |binding_id|
+        binding = @bindings[binding_id]
+        next unless binding
 
-      return path_str unless binding
+        value = dig_state_path(binding[:path])
 
-      puts binding.inspect
-
-      value = dig_state_path(binding[:path])
-
-      puts value.inspect
-
-      begin
-        puts "Binding found for #{path_str}, updating DOM with value: #{value.inspect}" if DEBUG
-        inner_html = capture_rendered_nodes { render_binding_result(binding[:block].call(value)) }
+        begin
+          puts "Binding found for #{path_str}/#{binding_id}, updating DOM with value: #{value.inspect}" if DEBUG
+          inner_html = capture_rendered_nodes { render_binding_result(binding[:block].call(value)) }
       rescue => e
         puts "⚠️ Erro ao renderizar binding #{path_str}: #{e.class} - #{e.message}"
         inner_html = ""
       end
 
+      { id: binding_id, html: inner_html }
+    end
+
+      return path_str if updates.empty?
+
       js = <<~JS
         (() => {
-          const nodes = document.querySelectorAll('[data-bind="#{path_str}"]');
-          nodes.forEach(el => {
-            el.innerHTML = #{inner_html.to_json};
+          const updates = #{updates.to_json};
+          updates.forEach(update => {
+            const nodes = document.querySelectorAll(`[data-bind-id="${update.id}"]`);
+            nodes.forEach(el => {
+              el.innerHTML = update.html;
+            });
           });
         })();
       JS
@@ -2667,6 +3177,14 @@ end
       html
     end
 
+    def served_page_feature(**attrs, &block)
+      component = ServedPageFeatureComponent.new(parent_renderer: @parent_renderer, owner: self, **attrs, &block)
+      add_child(component)
+      html = component.render_to_html
+      append_captured_node(html)
+      html
+    end
+
     def render_nodes(result)
       components = result.is_a?(Array) ? result : [result]
 
@@ -2723,6 +3241,116 @@ end
     def rerender
       puts "rerenderrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
       @parent_renderer.render
+    end
+  end
+
+  class ServedPageFeatureComponent < Component
+    def initialize(parent_renderer:, owner:, id:, title:, port: nil, path: nil, twa: {}, **attrs, &block)
+      super(parent_renderer: parent_renderer, **attrs)
+
+      @owner = owner
+      @id = id.to_s
+      @title = title.to_s
+      @port = port && port.to_i
+      @path = path
+      @twa = twa || {}
+      @children_block = block
+
+      @state[:public_url] = nil
+      register_page!
+      @state[:local_url] = Frontend.served_page_url(@id)
+      @state[:status] = "Pagina servida em localhost:#{served_port}."
+
+      ui do
+        section(class: "served-page-feature border border-[#d0d0d0] bg-white p-4 #{attrs[:class]}".strip) do
+          div(class: "flex items-start justify-between gap-4") do
+            div do
+              div("Served Page", class: "text-xs font-semibold uppercase tracking-[0.2em] text-[#525252]") +
+                h3(@title, class: "mt-1 text-lg font-semibold text-[#161616]")
+            end +
+              tag("localhost:#{served_port}", type: "blue")
+          end +
+            bind(:local_url, code(class: "mt-3 block break-all bg-[#f4f4f4] p-2 text-xs")) { |url| url.to_s } +
+            bind(:public_url, div(class: "mt-3")) do |url|
+              next "" if url.to_s.empty?
+
+              code(url.to_s, class: "block break-all bg-[#edf5ff] p-2 text-xs")
+            end +
+            bind(:status, p(class: "mt-3 text-sm text-[#525252]")) { |status| status.to_s } +
+            div(class: "mt-4 flex flex-wrap gap-2") do
+              button(kind: "secondary", onclick: proc { open_local_page }) { "Abrir local" } +
+                button(kind: "primary", onclick: proc { start_ngrok }) { "Ativar ngrok" } +
+                button(kind: "ghost", onclick: proc { generate_twa }) { "Gerar TWA" }
+            end
+        end
+      end
+    end
+
+    def open_local_page
+      Program.launch(@state[:local_url].to_s)
+      nil
+    end
+
+    def start_ngrok
+      tunnel = Frontend.start_ngrok_tunnel(@id, port: served_port)
+      batch do
+        set_state(:public_url, tunnel[:public_url], replace: true)
+        set_state(:status, "ngrok ativo: #{tunnel[:public_url]}", replace: true)
+      end
+      nil
+    rescue => e
+      set_state(:status, "Falha ao ativar ngrok: #{e.message}", replace: true)
+      nil
+    end
+
+    def generate_twa
+      output = Frontend.generate_twa_artifacts_for(@id, public_url: @state[:public_url], app_name: @title)
+      set_state(:status, "TWA gerado em #{output}", replace: true)
+      nil
+    rescue => e
+      set_state(:status, "Falha ao gerar TWA: #{e.message}", replace: true)
+      nil
+    end
+
+    private
+
+    def register_page!
+      html = render_page_document
+      Frontend.register_served_page(@id, title: @title, html: html, twa: @twa, port: @port)
+    end
+
+    def served_port
+      page = Frontend.served_page_registry[@id] || {}
+      (page[:port] || Frontend.server_port).to_i
+    end
+
+    def render_page_document
+      inner =
+        if @children_block
+          @owner.capture_rendered_nodes do
+            @children_block.arity.zero? ? @owner.instance_eval(&@children_block) : @owner.instance_exec(&@children_block)
+          end
+        else
+          ""
+        end
+
+      <<~HTML
+        <!DOCTYPE html>
+        <html>
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>#{@title}</title>
+            <style>
+              body { margin: 0; font-family: Arial, sans-serif; background: #f4f4f4; color: #161616; }
+              .served-page-root { max-width: 1120px; margin: 0 auto; padding: 24px; }
+            </style>
+          </head>
+          <body>
+            <main class="served-page-root">#{inner}</main>
+          </body>
+        </html>
+      HTML
     end
   end
 

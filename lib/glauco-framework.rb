@@ -52,7 +52,7 @@ module Glauco
       return unless blank?(ENV["GLAUCO_LLAMASERVER_BIN"])
 
       source = packaged_llama_server_source
-      return unless File.exist?(source)
+      return unless source && File.exist?(source)
 
       target_dir = File.join(Dir.tmpdir, "glauco-framework-runtime")
       target = File.join(target_dir, File.basename(source))

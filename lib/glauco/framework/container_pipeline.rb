@@ -147,7 +147,19 @@ module Glauco
 
       def docker_run_args
         args = ["run", "--rm", "--name", container_name]
+        args += ["--security-opt", "no-new-privileges:true"]
+        args += ["--cap-drop", "ALL"]
+        args += ["--read-only"]
+        args += ["--pids-limit", "256"]
+        args += ["--memory", "1g"]
+        args += ["--cpus", "1.0"]
+        args += ["--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=128m"]
+        args += ["--tmpfs", "/app/tmp:rw,noexec,nosuid,nodev,size=256m"]
+        args += ["--tmpfs", "/home/glauco:rw,noexec,nosuid,nodev,size=128m"]
+        args += ["--tmpfs", "/app/public:rw,noexec,nosuid,nodev,size=64m"]
+        args += ["--network", "none"] if ports.empty?
         args += ["-e", "GLAUCO_USE_HOST_DISPLAY=0"]
+        args += ["-e", "GLAUCO_PORT=8000"]
         env.each { |value| args += ["-e", value] }
         ports.each { |value| args += ["-p", value] }
         args << image

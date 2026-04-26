@@ -1,4 +1,5 @@
 require "fileutils"
+require "json"
 require "optparse"
 require "pathname"
 require "rbconfig"
@@ -42,6 +43,7 @@ module Glauco
         build_jar(warble_config_path)
 
         write_container_artifacts if write_container_files
+        write_twa_artifacts
       ensure
         FileUtils.rm_rf(work_root) if work_root && File.exist?(work_root)
       end
@@ -56,6 +58,14 @@ module Glauco
 
       def kubernetes_manifest_path
         File.join(output_dir, "kubernetes.yaml")
+      end
+
+      def dockerignore_path
+        File.join(output_dir, ".dockerignore")
+      end
+
+      def twa_output_dir
+        File.join(output_dir, "twa")
       end
 
       def slug
@@ -413,13 +423,83 @@ module Glauco
 
       def write_container_artifacts
         File.write(dockerfile_path, dockerfile_content)
+        File.write(dockerignore_path, dockerignore_content)
         File.write(kubernetes_manifest_path, kubernetes_manifest_content)
+      end
+
+      def dockerignore_content
+        <<~IGNORE
+          *
+          !Dockerfile
+          !#{File.basename(jar_path)}
+        IGNORE
+      end
+
+      def write_twa_artifacts
+        config_path = File.join(project_root, "config", "glauco_twa.json")
+        return unless File.file?(config_path)
+
+        config = JSON.parse(File.read(config_path))
+        apps = Array(config["apps"] || config[:apps])
+        return if apps.empty?
+
+        FileUtils.mkdir_p(twa_output_dir)
+        apps.each do |app|
+          id = app.fetch("id")
+          target = File.join(twa_output_dir, id)
+          FileUtils.mkdir_p(target)
+          host = app["host"] || "REPLACE_WITH_NGROK_HOST"
+          start_url = app["start_url"] || "/__glauco/pages/#{id}"
+          package_name = app["package"] || "app.glauco.#{id.gsub(/[^a-zA-Z0-9_]/, "_").downcase}"
+
+          File.write(File.join(target, "twa-manifest.json"), JSON.pretty_generate(
+            packageId: package_name,
+            host: host,
+            name: app["name"] || id,
+            launcherName: app["launcher_name"] || app["name"] || id,
+            startUrl: start_url,
+            display: "standalone",
+            themeColor: app["theme_color"] || "#0f62fe",
+            navigationColor: app["navigation_color"] || "#0f62fe",
+            signingKey: { path: "android.keystore", alias: "android" }
+          ))
+          File.write(File.join(target, "assetlinks.json"), JSON.pretty_generate([
+            {
+              relation: ["delegate_permission/common.handle_all_urls"],
+              target: {
+                namespace: "android_app",
+                package_name: package_name,
+                sha256_cert_fingerprints: Array(app["sha256_cert_fingerprints"])
+              }
+            }
+          ]))
+          File.write(File.join(target, "build-twa.ps1"), <<~PS1)
+            Set-StrictMode -Version Latest
+            $ErrorActionPreference = "Stop"
+            Set-Location $PSScriptRoot
+            bubblewrap init --manifest twa-manifest.json
+            bubblewrap build
+          PS1
+          sh_path = File.join(target, "build-twa.sh")
+          File.write(sh_path, <<~SH)
+            #!/usr/bin/env sh
+            set -eu
+            cd "$(dirname "$0")"
+            bubblewrap init --manifest twa-manifest.json
+            bubblewrap build
+          SH
+          File.chmod(0o755, sh_path) rescue nil
+        end
       end
 
       def dockerfile_content
         <<~DOCKERFILE
           ARG BASE_IMAGE=#{base_image}
           FROM ${BASE_IMAGE}
+
+          LABEL org.opencontainers.image.title="#{slug}"
+          LABEL org.opencontainers.image.vendor="Glauco"
+          LABEL org.opencontainers.image.description="Glauco app hardened runtime"
 
           WORKDIR /app
 
@@ -440,23 +520,29 @@ module Glauco
            && addgroup --system --gid 10001 glauco \\
            && adduser --system --uid 10001 --ingroup glauco --home /home/glauco glauco \\
            && mkdir -p /home/glauco /app/tmp \\
-           && chown -R 10001:10001 /home/glauco /app/tmp
+           && chown -R 10001:10001 /home/glauco /app/tmp \\
+           && chmod 700 /home/glauco /app/tmp
 
-          COPY #{File.basename(jar_path)} /app/#{File.basename(jar_path)}
+          COPY --chown=10001:10001 #{File.basename(jar_path)} /app/#{File.basename(jar_path)}
           RUN printf '%s\\n' \\
               '#!/usr/bin/env sh' \\
-              'set -eu' \\
+              'set -euf' \\
+              'umask 077' \\
               'if [ "${GLAUCO_USE_HOST_DISPLAY:-0}" = "1" ]; then' \\
               '  exec java -jar /app/#{File.basename(jar_path)}' \\
               'fi' \\
               'exec xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24 -nolisten tcp" java -jar /app/#{File.basename(jar_path)}' \\
               > /app/glauco-entrypoint \\
-           && chmod +x /app/glauco-entrypoint
+           && chmod 0555 /app/glauco-entrypoint \\
+           && chmod 0444 /app/#{File.basename(jar_path)}
 
           ENV HOME=/home/glauco
+          ENV GLAUCO_PORT=8000
           ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75 -Dfile.encoding=UTF-8 -Djava.io.tmpdir=/app/tmp -Dorg.eclipse.swt.browser.DefaultType=webkit"
           ENV SWT_GTK3=1
           ENV DISPLAY=:99
+
+          EXPOSE 8000
 
           USER 10001:10001
 
@@ -470,6 +556,10 @@ module Glauco
           kind: Namespace
           metadata:
             name: #{namespace}
+            labels:
+              pod-security.kubernetes.io/enforce: restricted
+              pod-security.kubernetes.io/audit: restricted
+              pod-security.kubernetes.io/warn: restricted
           ---
           apiVersion: v1
           kind: ServiceAccount
@@ -496,12 +586,23 @@ module Glauco
                 serviceAccountName: #{slug}
                 automountServiceAccountToken: false
                 securityContext:
+                  runAsNonRoot: true
+                  runAsUser: 10001
+                  runAsGroup: 10001
+                  fsGroup: 10001
+                  fsGroupChangePolicy: OnRootMismatch
                   seccompProfile:
                     type: RuntimeDefault
                 containers:
                   - name: #{slug}
                     image: #{image}
                     imagePullPolicy: IfNotPresent
+                    ports:
+                      - name: http
+                        containerPort: 8000
+                    env:
+                      - name: GLAUCO_PORT
+                        value: "8000"
                     resources:
                       requests:
                         cpu: 250m
@@ -515,9 +616,27 @@ module Glauco
                       runAsGroup: 10001
                       readOnlyRootFilesystem: true
                       allowPrivilegeEscalation: false
+                      privileged: false
+                      procMount: Default
                       capabilities:
                         drop:
                           - ALL
+                    readinessProbe:
+                      httpGet:
+                        path: /__glauco/ping
+                        port: http
+                      initialDelaySeconds: 10
+                      periodSeconds: 10
+                      timeoutSeconds: 2
+                      failureThreshold: 6
+                    livenessProbe:
+                      httpGet:
+                        path: /__glauco/ping
+                        port: http
+                      initialDelaySeconds: 30
+                      periodSeconds: 20
+                      timeoutSeconds: 2
+                      failureThreshold: 3
                     volumeMounts:
                       - name: tmp
                         mountPath: /tmp
@@ -536,6 +655,47 @@ module Glauco
                     emptyDir: {}
                   - name: public
                     emptyDir: {}
+          ---
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: #{slug}-default-deny
+            namespace: #{namespace}
+          spec:
+            podSelector:
+              matchLabels:
+                app: #{slug}
+            policyTypes:
+              - Ingress
+              - Egress
+          ---
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: #{slug}-allow-http-dns-https
+            namespace: #{namespace}
+          spec:
+            podSelector:
+              matchLabels:
+                app: #{slug}
+            policyTypes:
+              - Ingress
+              - Egress
+            ingress:
+              - from:
+                  - podSelector: {}
+                ports:
+                  - protocol: TCP
+                    port: 8000
+            egress:
+              - ports:
+                  - protocol: UDP
+                    port: 53
+                  - protocol: TCP
+                    port: 53
+              - ports:
+                  - protocol: TCP
+                    port: 443
         YAML
       end
     end
